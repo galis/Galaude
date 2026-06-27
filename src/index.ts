@@ -9,6 +9,8 @@ const userInput =
 
 console.log(`\n💬 用户输入: ${userInput}`);
 
-const answer = await runAgent(userInput);
+// 注意：最终答案现在是「流式」边生成边打印的（见 agent.ts 的 🤖 输出），
+// 所以这里不再整段重复，只给个完成标记；完整记录在 logs/last.log。
+await runAgent(userInput);
 
-console.log(`\n✅ 最终答案:\n${answer}\n`);
+console.log(`\n✅ 完成。完整 prompt/响应见 logs/last.log\n`);

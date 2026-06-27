@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { config } from "./config.js";
 
 /**
  * DeepSeek 走 OpenAI 兼容协议，所以直接用官方 openai SDK，
@@ -10,7 +11,7 @@ export const client = new OpenAI({
   baseURL: "https://api.deepseek.com",
 });
 
-export const MODEL = process.env.DEEPSEEK_MODEL ?? "deepseek-v4-pro";
+export const MODEL = config.model;
 
 if (!process.env.DEEPSEEK_API_KEY) {
   throw new Error(
