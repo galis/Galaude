@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import type OpenAI from "openai";
 
 /**
@@ -28,6 +29,27 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ["expression"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "run_bash",
+      description:
+        "在本机执行一条 bash 命令并返回输出（stdout+stderr+退出码）。" +
+        "适合查文件、看目录、查日期/系统信息、跑命令行工具等。" +
+        "例如 'ls -la'、'date'、'cat package.json'、'df -h'。",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "要执行的 bash 命令，例如 'ls -la' 或 'uname -a'",
+          },
+        },
+        required: ["command"],
         additionalProperties: false,
       },
     },
@@ -63,5 +85,23 @@ export const toolRegistry: Record<string, ToolImpl> = {
        return (${js});`
     )(Math);
     return `${expr} = ${result}`;
+  },
+
+  run_bash({ command }) {
+    const cmd = String(command ?? "").trim();
+    if (!cmd) throw new Error("command 为空");
+
+    // 同步执行；限时 15s、限输出 1MB，避免卡死/刷爆。
+    const r = spawnSync("bash", ["-c", cmd], {
+      encoding: "utf8",
+      timeout: 15_000,
+      maxBuffer: 1024 * 1024,
+    });
+    if (r.error) throw r.error; // 比如超时（ETIMEDOUT）
+
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+    const body =
+      out.length > 4000 ? out.slice(0, 4000) + "\n…(输出已截断)" : out;
+    return `exit=${r.status}\n${body || "(无输出)"}`;
   },
 };
