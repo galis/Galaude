@@ -117,19 +117,23 @@ async function streamModel(
   messages: Message[],
   logger: RunLogger,
   turn: number,
-  emit: Emitter
+  emit: Emitter,
+  signal?: AbortSignal
 ): Promise<{
   assistantMsg: AssistantParam;
   finishReason: string | null;
   usage: Chunk["usage"];
 }> {
-  const stream = await client.chat.completions.create({
-    model: MODEL,
-    messages,
-    tools: toolSchemas,
-    stream: true,
-    stream_options: { include_usage: true }, // 流式默认不给 usage，显式打开
-  });
+  const stream = await client.chat.completions.create(
+    {
+      model: MODEL,
+      messages,
+      tools: toolSchemas,
+      stream: true,
+      stream_options: { include_usage: true }, // 流式默认不给 usage，显式打开
+    },
+    { signal } // 传入中断信号：Ctrl+C 时 abort，会让流式迭代抛错而停止
+  );
 
   let content = "";
   let reasoning = ""; // 累积思维链，连同正文一起落进日志
@@ -245,7 +249,8 @@ export function createSession(): Session {
 export async function runAgent(
   session: Session,
   userInput: string,
-  emit: Emitter = makeConsoleEmitter()
+  emit: Emitter = makeConsoleEmitter(),
+  signal?: AbortSignal
 ): Promise<string> {
   const { messages, logger } = session;
   session.round++;
@@ -269,7 +274,8 @@ export async function runAgent(
       messages,
       logger,
       turn,
-      emit
+      emit,
+      signal
     );
 
     // 把模型这一轮的回复（可能含 tool_calls）原样追加进历史。
