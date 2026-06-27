@@ -124,6 +124,7 @@ function App({ session }: { session: Session }) {
     cols: stdout.columns || 80,
     rows: stdout.rows || 24,
   });
+  const abortRef = useRef<AbortController | null>(null); // 当前生成的中断器
 
   // 跟随终端尺寸变化（备用屏进入/退出在 renderUI 里）。
   useEffect(() => {
@@ -165,6 +166,8 @@ function App({ session }: { session: Session }) {
 
       push({ kind: "user", text });
       setBusy(true);
+      const ac = new AbortController(); // Ctrl+C 时 abort 它来中断本次生成
+      abortRef.current = ac;
       let acc = "";
       const emit: Emitter = (ev) => {
         if (ev.type === "assistant") {
@@ -179,14 +182,23 @@ function App({ session }: { session: Session }) {
         }
       };
       try {
-        const answer = await runAgent(session, text, emit);
-        push({ kind: "assistant", text: answer });
+        const answer = await runAgent(session, text, emit, ac.signal);
+        // 中断时流可能「优雅结束」（不抛错）：保留已生成的部分，并标注已中断。
+        if (ac.signal.aborted) {
+          if (answer.trim()) push({ kind: "assistant", text: answer });
+          push({ kind: "note", text: "⛔ 已中断" });
+        } else {
+          push({ kind: "assistant", text: answer });
+        }
       } catch (err) {
-        push({
-          kind: "note",
-          text: `❌ 出错: ${err instanceof Error ? err.message : String(err)}`,
-        });
+        if (ac.signal.aborted) push({ kind: "note", text: "⛔ 已中断" });
+        else
+          push({
+            kind: "note",
+            text: `❌ 出错: ${err instanceof Error ? err.message : String(err)}`,
+          });
       } finally {
+        abortRef.current = null;
         setStreaming("");
         setBusy(false);
       }
@@ -224,7 +236,12 @@ function App({ session }: { session: Session }) {
       s = s.replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "").replace(/\x1b./g, "");
       for (const ch of s) {
         const code = ch.codePointAt(0)!;
-        if (code === 3) return exit(); // Ctrl+C
+        if (code === 3) {
+          // Ctrl+C：生成中 → 中断本次生成回到输入；空闲 → 退出
+          if (busyRef.current && abortRef.current) abortRef.current.abort();
+          else exit();
+          return;
+        }
         if (busyRef.current) continue; // 处理中只接受滚动 / Ctrl+C
         if (ch === "\r" || ch === "\n") submitRef.current(inputRef.current);
         else if (code === 127 || code === 8) setInput((v) => v.slice(0, -1));
@@ -296,7 +313,9 @@ function App({ session }: { session: Session }) {
 export async function renderUI(session: Session): Promise<void> {
   // 先切到备用屏并清屏，再 render —— 这样首帧直接画在备用屏上，无需按键刷新。
   process.stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
-  const app = render(<App session={session} />);
+  // exitOnCtrlC: false —— 关掉 ink 自带的 Ctrl+C 退出，改由我们自己处理：
+  // 生成中 → 中断本次生成；空闲 → 退出。
+  const app = render(<App session={session} />, { exitOnCtrlC: false });
   try {
     await app.waitUntilExit();
   } finally {
