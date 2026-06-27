@@ -182,30 +182,45 @@ async function streamModel(
   return { assistantMsg, finishReason, usage };
 }
 
-export async function runAgent(userInput: string): Promise<string> {
-  // 完整的对话历史。每一轮都要把它整个传给（无状态的）API。
-  const messages: Message[] = [
-    {
-      role: "system",
-      content:
-        "你是一个会使用工具的助手。需要算数时必须调用 calculate 工具，不要自己心算。",
-    },
-    { role: "user", content: userInput },
-  ];
+export const SYSTEM_PROMPT =
+  "你是一个会使用工具的助手。需要算数时必须调用 calculate 工具，不要自己心算。";
 
-  // 文件日志：完整 prompt 正文写到 logs/run-*.log（控制台只放精简版）。
+/** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
+export interface Session {
+  messages: Message[];
+  logger: RunLogger;
+  round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
+}
+
+/** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
+export function createSession(): Session {
   const logger = createRunLogger();
-  console.log(`📝 详细日志: ${logger.path}`);
   logger.section("工具定义 toolSchemas（随每轮一起发给模型）");
   logger.log(JSON.stringify(toolSchemas, null, 2));
-  logger.section("USER INPUT");
+  const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
+  return { messages, logger, round: 0 };
+}
+
+/**
+ * 处理「一次用户输入」：追加进会话历史，跑完 think→act→observe 循环
+ * 直到模型给出自然语言答案，返回该答案。历史留在 session 里，下次调用
+ * 自动带上下文——这就是多轮对话的关键。
+ */
+export async function runAgent(
+  session: Session,
+  userInput: string
+): Promise<string> {
+  const { messages, logger } = session;
+  session.round++;
+  messages.push({ role: "user", content: userInput });
+  logger.section(`========== 用户输入 #${session.round} ==========`);
   logger.log(userInput);
 
   // 最大轮数上限，防止模型陷入死循环（Phase 2 会再强化鲁棒性）。
   const MAX_TURNS = 10;
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
-    console.log(`\n──────── 第 ${turn} 轮：调用模型 ────────`);
+    dbg(`\n──────── 第 ${turn} 轮：调用模型 ────────`);
     // 这一轮「发出去」的历史：每轮都把完整 messages 重新传给无状态的 API。
     dbg(`📤 发送历史（${messages.length} 条）: ${timeline(messages)}`);
     // 完整 prompt 正文（就是这次实际发给模型的 messages）写进日志文件。
@@ -253,7 +268,6 @@ export async function runAgent(userInput: string): Promise<string> {
           : "(模型没有返回文本内容)";
       logger.section("最终答案");
       logger.log(finalAnswer);
-      console.log(`📝 详细日志已保存: ${logger.path}`);
       return finalAnswer;
     }
 
