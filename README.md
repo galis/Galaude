@@ -8,11 +8,12 @@
 npm install
 cp .env.example .env        # 然后填入你的 DEEPSEEK_API_KEY
 
-npm run dev                 # 进入多轮对话（终端 REPL，像 Claude Code）
+npm run dev                 # 进入多轮对话（Ink 终端 UI，输入框固定底部）
 npm run dev -- "帮我算 (3+4)*5"   # 一次性模式：跑一句就退出
 ```
 
-进入 REPL 后输入问题即可，多轮之间自动保留上下文。命令：
+交互界面用 Ink（React for 终端）：输入框钉在最底部，回答/工具调用在上方滚动，
+回答流式刷新；敲 `/` 在输入框上方弹出实时筛选的命令菜单。命令：
 
 ```
 /exit, /quit   退出
@@ -29,9 +30,13 @@ src/
   llm.ts      # DeepSeek 客户端（openai SDK + baseURL）、模型名
   tools.ts    # 工具的「声明」(JSON schema) + 「实现」(本地函数注册表)
   logger.ts   # 会话日志（每次运行一个 logs/run-*.log，last.log 软链最新）
-  agent.ts    # 核心 think→act→observe 循环 + 流式 + 会话(Session)
-  index.ts    # 入口：终端 REPL / 一次性模式
+  agent.ts    # 核心 think→act→observe 循环 + 流式 + 会话(Session)；对外发「事件」
+  ui.tsx      # Ink 交互界面（固定底部输入框 + 上方滚动 + 斜杠菜单）
+  index.ts    # 入口：TTY→Ink UI / 一次性 / 管道回退
 ```
+
+> agent.ts 不直接写屏，而是把「要显示的东西」抛成事件（`AgentEvent`），
+> 由控制台或 Ink UI 决定怎么渲染——这样 Ink 接管屏幕时不会被 console.log 冲乱。
 
 ## 核心原理（看代码时重点理解）
 
