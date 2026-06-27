@@ -6,9 +6,48 @@ import { config } from "./config.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
-// 调试日志开关（见 config.ts）。不开调试器也能看到 messages 怎么变。
+// 调试开关（见 config.ts）。
 const DEBUG = config.debug;
-const dbg = (...args: unknown[]) => DEBUG && console.log(...args);
+
+/**
+ * agent 把「该显示给用户的东西」抽象成事件，由外层（控制台 or Ink UI）决定怎么渲染。
+ * 这样 agent 核心不直接写屏，Ink 接管屏幕时才不会被 console.log 冲乱。
+ * 文件日志（logger）与此独立，照常写。
+ */
+export type AgentEvent =
+  | { type: "reasoning"; text: string } // 思维链增量
+  | { type: "assistant"; text: string } // 回答正文增量
+  | { type: "tool_call"; name: string; argsText: string }
+  | { type: "tool_result"; name: string; result: string }
+  | { type: "debug"; text: string };
+export type Emitter = (ev: AgentEvent) => void;
+
+/** 默认事件渲染：写到控制台（一次性 / 管道模式用），尽量还原老输出。 */
+export function makeConsoleEmitter(): Emitter {
+  let answerStarted = false;
+  return (ev) => {
+    switch (ev.type) {
+      case "reasoning":
+        if (DEBUG) process.stdout.write(ev.text);
+        break;
+      case "assistant":
+        if (!answerStarted)
+          (process.stdout.write("\n🤖 "), (answerStarted = true));
+        process.stdout.write(ev.text);
+        break;
+      case "tool_call":
+        answerStarted = false;
+        console.log(`\n🔧 模型请求工具: ${ev.name}(${ev.argsText})`);
+        break;
+      case "tool_result":
+        console.log(`   ↳ 结果: ${ev.result}`);
+        break;
+      case "debug":
+        if (DEBUG) console.log(ev.text);
+        break;
+    }
+  };
+}
 
 // 把整条历史压成一行 role 时间线，最直观地看出循环在怎么推进：
 // system → user → assistant → tool → assistant → ...
@@ -77,7 +116,8 @@ function describeChunk(chunk: Chunk): string {
 async function streamModel(
   messages: Message[],
   logger: RunLogger,
-  turn: number
+  turn: number,
+  emit: Emitter
 ): Promise<{
   assistantMsg: AssistantParam;
   finishReason: string | null;
@@ -97,8 +137,6 @@ async function streamModel(
   const parts: { id: string; name: string; arguments: string }[] = [];
   let finishReason: string | null = null;
   let usage: Chunk["usage"] = undefined;
-  let answerHeader = false;
-  let reasonHeader = false;
   let chunkNo = 0;
 
   // 流式逐片追踪（config.traceStream）：把每个 delta chunk 原样记进日志。
@@ -133,18 +171,13 @@ async function streamModel(
       .reasoning_content;
     if (reasoningDelta) {
       reasoning += reasoningDelta; // 累积，供日志记录
-      if (DEBUG) {
-        if (!reasonHeader)
-          (process.stdout.write("\n💭 "), (reasonHeader = true));
-        process.stdout.write(reasoningDelta);
-      }
+      emit({ type: "reasoning", text: reasoningDelta });
     }
 
-    // 正文：边到边打，这就是“流式”的直观效果
+    // 正文：边到边发事件，这就是“流式”的直观效果
     if (delta.content) {
-      if (!answerHeader) (process.stdout.write("\n🤖 "), (answerHeader = true));
-      process.stdout.write(delta.content);
       content += delta.content;
+      emit({ type: "assistant", text: delta.content });
     }
 
     // tool_calls 分片到达：按 index 拼回完整的一次调用
@@ -158,7 +191,6 @@ async function streamModel(
       }
     }
   }
-  if (answerHeader || reasonHeader) process.stdout.write("\n");
 
   const toolCalls = parts.filter(Boolean).map((p) => ({
     id: p.id,
@@ -183,7 +215,11 @@ async function streamModel(
 }
 
 export const SYSTEM_PROMPT =
-  "你是一个会使用工具的助手。需要算数时必须调用 calculate 工具，不要自己心算。";
+  "你是一个 AI 编程 Agent 助手，帮用户在本机完成编程相关任务。" +
+  "你可以使用工具：用 run_bash 执行 bash 命令（查看/搜索/读写文件、跑测试、git、查系统信息等），" +
+  "用 calculate 做精确计算。" +
+  "优先通过工具获取真实信息，不要凭空臆测或编造文件内容；" +
+  "多步任务就一步步调用工具推进，完成后用简洁清晰的话回答。";
 
 /** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
 export interface Session {
@@ -208,7 +244,8 @@ export function createSession(): Session {
  */
 export async function runAgent(
   session: Session,
-  userInput: string
+  userInput: string,
+  emit: Emitter = makeConsoleEmitter()
 ): Promise<string> {
   const { messages, logger } = session;
   session.round++;
@@ -220,9 +257,9 @@ export async function runAgent(
   const MAX_TURNS = 10;
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
-    dbg(`\n──────── 第 ${turn} 轮：调用模型 ────────`);
+    emit({ type: "debug", text: `──────── 第 ${turn} 轮：调用模型 ────────` });
     // 这一轮「发出去」的历史：每轮都把完整 messages 重新传给无状态的 API。
-    dbg(`📤 发送历史（${messages.length} 条）: ${timeline(messages)}`);
+    emit({ type: "debug", text: `📤 发送历史（${messages.length} 条）: ${timeline(messages)}` });
     // 完整 prompt 正文（就是这次实际发给模型的 messages）写进日志文件。
     logger.section(`第 ${turn} 轮 — 发送给模型的完整 messages（即 prompt）`);
     logger.log(JSON.stringify(messages, null, 2));
@@ -231,7 +268,8 @@ export async function runAgent(
     const { assistantMsg, finishReason, usage } = await streamModel(
       messages,
       logger,
-      turn
+      turn,
+      emit
     );
 
     // 把模型这一轮的回复（可能含 tool_calls）原样追加进历史。
@@ -245,21 +283,23 @@ export async function runAgent(
         )
     );
     if (usage) {
-      dbg(
-        `📊 token: prompt=${usage.prompt_tokens} ` +
+      emit({
+        type: "debug",
+        text:
+          `📊 token: prompt=${usage.prompt_tokens} ` +
           `completion=${usage.completion_tokens} ` +
-          `finish_reason=${finishReason}`
-      );
+          `finish_reason=${finishReason}`,
+      });
     }
 
     const toolCalls = assistantMsg.tool_calls;
 
     // —— 没有 tool_calls：模型给出最终答案，循环结束 ——
     if (!toolCalls || toolCalls.length === 0) {
-      dbg(
-        `🏁 退出循环（共 ${turn} 轮，最终历史 ${messages.length} 条）: ` +
-          timeline(messages)
-      );
+      emit({
+        type: "debug",
+        text: `🏁 退出循环（共 ${turn} 轮，最终历史 ${messages.length} 条）: ${timeline(messages)}`,
+      });
       // content 类型是 string | ContentPart[] | null；streamModel 里我们
       // 始终把它拼成 string，这里收窄一下让类型也对齐。
       const finalAnswer =
@@ -271,13 +311,16 @@ export async function runAgent(
       return finalAnswer;
     }
 
-    dbg(`🧩 本轮模型请求 ${toolCalls.length} 个工具，开始本地执行 …`);
+    emit({
+      type: "debug",
+      text: `🧩 本轮模型请求 ${toolCalls.length} 个工具，开始本地执行 …`,
+    });
 
     // —— act + observe：逐个执行模型请求的工具 ——
     for (const call of toolCalls) {
       const { name, arguments: rawArgs } = call.function;
       const args = JSON.parse(rawArgs || "{}");
-      console.log(`🔧 模型请求工具: ${name}(${rawArgs})`);
+      emit({ type: "tool_call", name, argsText: rawArgs });
 
       // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
       // 而不是直接抛异常掀翻整个循环。模型看到错误信息后，往往能
@@ -289,7 +332,7 @@ export async function runAgent(
       } catch (err) {
         result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
       }
-      console.log(`   ↳ 结果: ${result}`);
+      emit({ type: "tool_result", name, result });
       logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);
 
       // observation 必须用 role:"tool"，且 tool_call_id 要和请求对应上。
