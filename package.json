@@ -1,0 +1,21 @@
+{
+  "name": "galaude",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "从零手写的 agent 编排器（学习向）— think → act → observe 循环",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "openai": "^4.77.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
