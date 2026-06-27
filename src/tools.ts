@@ -1,5 +1,8 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type OpenAI from "openai";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * 工具 = 两部分：
@@ -58,7 +61,10 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
 
 // —— 2. 实现：工具名 → 本地函数 的注册表 ——
 // 每个实现接收「已解析好的参数对象」，返回一个字符串（喂回给模型当 observation）。
-type ToolImpl = (args: Record<string, unknown>) => string;
+// 允许返回 Promise：像 run_bash 这种 IO 工具必须异步，否则会卡死事件循环（UI 冻结）。
+type ToolImpl = (
+  args: Record<string, unknown>
+) => string | Promise<string>;
 
 export const toolRegistry: Record<string, ToolImpl> = {
   calculate({ expression }) {
@@ -87,21 +93,32 @@ export const toolRegistry: Record<string, ToolImpl> = {
     return `${expr} = ${result}`;
   },
 
-  run_bash({ command }) {
+  async run_bash({ command }) {
     const cmd = String(command ?? "").trim();
     if (!cmd) throw new Error("command 为空");
 
-    // 同步执行；限时 15s、限输出 1MB，避免卡死/刷爆。
-    const r = spawnSync("bash", ["-c", cmd], {
-      encoding: "utf8",
-      timeout: 15_000,
-      maxBuffer: 1024 * 1024,
-    });
-    if (r.error) throw r.error; // 比如超时（ETIMEDOUT）
-
-    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
-    const body =
-      out.length > 4000 ? out.slice(0, 4000) + "\n…(输出已截断)" : out;
-    return `exit=${r.status}\n${body || "(无输出)"}`;
+    // 异步执行（不阻塞事件循环 → UI 不冻结）；限时 15s、限输出 1MB。
+    const clip = (s: string) =>
+      s.length > 4000 ? s.slice(0, 4000) + "\n…(输出已截断)" : s;
+    try {
+      const { stdout, stderr } = await execFileAsync("bash", ["-c", cmd], {
+        encoding: "utf8",
+        timeout: 15_000,
+        maxBuffer: 1024 * 1024,
+      });
+      return `exit=0\n${clip(`${stdout}${stderr}`) || "(无输出)"}`;
+    } catch (e) {
+      // 非零退出/超时：execFile 会 reject，但 stdout/stderr 仍带回内容。
+      const err = e as {
+        code?: number | string;
+        signal?: string;
+        stdout?: string;
+        stderr?: string;
+        message?: string;
+      };
+      const out = clip(`${err.stdout ?? ""}${err.stderr ?? ""}`);
+      const status = err.signal ?? err.code ?? "?";
+      return `exit=${status}\n${out || err.message || "(出错)"}`;
+    }
   },
 };

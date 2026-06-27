@@ -328,7 +328,7 @@ export async function runAgent(
       const impl = toolRegistry[name];
       let result: string;
       try {
-        result = impl ? impl(args) : `错误：未知工具 "${name}"`;
+        result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
       } catch (err) {
         result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
       }
