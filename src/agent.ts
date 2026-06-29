@@ -560,45 +560,60 @@ export async function runAgent(
 
     emit({
       type: "debug",
-      text: `🧩 本轮模型请求 ${toolCalls.length} 个工具，开始本地执行 …`,
+      text: `🧩 本轮模型请求 ${toolCalls.length} 个工具（执行并行 / 审批串行）…`,
     });
 
-    // —— act + observe：逐个执行模型请求的工具 ——
-    for (const call of toolCalls) {
-      const { name, arguments: rawArgs } = call.function;
-      emit({ type: "tool_call", name, argsText: rawArgs });
+    // —— act + observe：执行并行、审批串行、结果按原序配回 ——
+    // 模型在一条消息里批量请求的工具默认互不依赖，可并行；但确认门要一次一个、
+    // 结果要按 tool_call_id 原序写回（配对不乱）。
 
-      let result: string;
-      // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
-      // 而不是直接抛异常掀翻整个循环。
+    // 阶段 1：先把所有 tool_call 显示出来
+    for (const call of toolCalls)
+      emit({ type: "tool_call", name: call.function.name, argsText: call.function.arguments });
+
+    // results[i]: 已定结果(被拒/参数错)用字符串占位，null=待并行执行
+    const results: (string | null)[] = toolCalls.map(() => null);
+    const parsed: (Record<string, unknown> | null)[] = toolCalls.map(() => null);
+
+    // 阶段 2：串行解析 + 审批（一次只弹一个确认框）
+    for (let i = 0; i < toolCalls.length; i++) {
+      const { name, arguments: rawArgs } = toolCalls[i]!.function;
+      let args: Record<string, unknown>;
       try {
-        const args = JSON.parse(rawArgs || "{}");
-        // 危险工具先过用户确认门（确认框带可读预览：命令 / diff）；
-        // 被拒绝就把「已拒绝」当 observation 喂回，模型据此换个做法。
-        if (needsApproval.has(name)) {
-          const preview = await describeForApproval(name, args);
-          if (!(await approve({ name, argsText: rawArgs, preview }))) {
-            result = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
-            emit({ type: "tool_result", name, result });
-            logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);
-            messages.push({ role: "tool", tool_call_id: call.id, content: result });
-            continue;
+        args = JSON.parse(rawArgs || "{}");
+      } catch (err) {
+        results[i] = `工具执行出错：参数不是合法 JSON（${err instanceof Error ? err.message : String(err)}）`;
+        continue;
+      }
+      parsed[i] = args;
+      if (needsApproval.has(name)) {
+        const preview = await describeForApproval(name, args);
+        if (!(await approve({ name, argsText: rawArgs, preview })))
+          results[i] = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
+      }
+    }
+
+    // 阶段 3：并行执行（只跑还没定结果的；各自 try/catch；完成即 emit，乱序但带名字）
+    await Promise.all(
+      toolCalls.map(async (call, i) => {
+        const name = call.function.name;
+        if (results[i] === null) {
+          const impl = toolRegistry[name];
+          try {
+            results[i] = impl ? await impl(parsed[i]!) : `错误：未知工具 "${name}"`;
+          } catch (err) {
+            results[i] = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
           }
         }
-        const impl = toolRegistry[name];
-        result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
-      } catch (err) {
-        result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
-      }
-      emit({ type: "tool_result", name, result });
-      logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);
+        emit({ type: "tool_result", name, result: results[i]! });
+      })
+    );
 
-      // observation 必须用 role:"tool"，且 tool_call_id 要和请求对应上。
-      messages.push({
-        role: "tool",
-        tool_call_id: call.id,
-        content: result,
-      });
+    // 阶段 4：按原顺序写回 messages（observation 用 role:"tool"，tool_call_id 对应上）
+    for (let i = 0; i < toolCalls.length; i++) {
+      const call = toolCalls[i]!;
+      logger.log(`[tool] ${call.function.name}(${call.function.arguments}) => ${results[i]}`);
+      messages.push({ role: "tool", tool_call_id: call.id, content: results[i]! });
     }
     // 带着新的 observation 回到循环顶部，再次 think。
   }
