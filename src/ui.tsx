@@ -11,6 +11,7 @@ import {
   type ApprovalRequest,
 } from "./agent.js";
 import { listSessions, loadSession, type StoredSession } from "./store.js";
+import { contextReport } from "./compress.js";
 import { config } from "./config.js";
 import type OpenAI from "openai";
 
@@ -23,6 +24,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/resume", desc: "切换到某个历史会话（可选 id，或回车选择）" },
   { name: "/sessions", desc: "列出历史会话" },
   { name: "/history", desc: "打印当前历史的 role 时间线" },
+  { name: "/context", desc: "显示当前上下文占用情况" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
 ];
@@ -296,6 +298,9 @@ function App({ session }: { session: Session }) {
           kind: "note",
           text: `🧠 历史（${session.messages.length} 条）: ${tl}`,
         });
+      }
+      if (text === "/context") {
+        return push({ kind: "note", text: contextReport(session) });
       }
       if (text.startsWith("/"))
         return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });

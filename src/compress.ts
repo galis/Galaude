@@ -200,3 +200,41 @@ export function applyFold(
   const level = Math.max(...segs.slice(i, j + 1).map((x) => x.level)) + 1;
   segs.splice(i, j - i + 1, { range, level, text });
 }
+
+// ———————————————————— 上下文占用报告（/context 用）————————————————————
+
+/** 生成一份可读的上下文占用细分（真相源 / 已折叠 / 摘要 / 记忆 / 近段 / 本轮投影）。 */
+export function contextReport(s: CompressState): string {
+  const { messages, summaries, summarizedUpTo: k, memory, lastPromptTokens } = s;
+  const pct = Math.round((lastPromptTokens / budget) * 100);
+  const recent = Math.max(0, messages.length - 1 - k); // 近段消息数（除 system）
+  const levels: Record<number, number> = {};
+  for (const seg of summaries) levels[seg.level] = (levels[seg.level] ?? 0) + 1;
+  const levelStr =
+    Object.entries(levels)
+      .map(([l, n]) => `level${l}×${n}`)
+      .join(", ") || "无";
+  const proj = buildContext(s).length;
+
+  const out = [
+    "📊 上下文占用情况",
+    `  ctx: ${lastPromptTokens} / ${budget} tok (${pct}%)  —— 裁剪@${Math.round(
+      trimFrac * 100
+    )}% 折叠@${Math.round(summarizeFrac * 100)}%`,
+    `  完整历史: ${messages.length} 条消息（真相源，存盘/界面用，永不删）`,
+    summaries.length
+      ? `  已折叠: messages[1..${k}] → 摘要 ${summaries.length} 段（${levelStr}）`
+      : "  已折叠: 无（还没触发摘要）",
+    `  外置记忆: ${memory.length} 条事实（豁免压缩，每轮必带）`,
+    `  近段原文: ${recent} 条（发给模型时带全）`,
+    `  → 本轮投影: 实际发给模型 ${proj} 条消息${
+      lastPromptTokens > trimThreshold ? "（近段含裁剪）" : ""
+    }`,
+  ];
+  if (memory.length) {
+    out.push("  记忆内容:");
+    for (const f of memory.slice(0, 8)) out.push(`    • ${f}`);
+    if (memory.length > 8) out.push(`    …（共 ${memory.length} 条）`);
+  }
+  return out.join("\n");
+}
