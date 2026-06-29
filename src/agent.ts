@@ -8,6 +8,7 @@ import {
 } from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
+import { newSessionId, saveSession, type StoredSession } from "./store.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -243,6 +244,8 @@ export const SYSTEM_PROMPT =
 
 /** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
 export interface Session {
+  id: string; // 会话 id，对应 sessions/<id>.json
+  createdAt: string;
   messages: Message[];
   logger: RunLogger;
   round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
@@ -254,7 +257,42 @@ export function createSession(): Session {
   logger.section("工具定义 toolSchemas（随每轮一起发给模型）");
   logger.log(JSON.stringify(toolSchemas, null, 2));
   const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
-  return { messages, logger, round: 0 };
+  return {
+    id: newSessionId(),
+    createdAt: new Date().toISOString(),
+    messages,
+    logger,
+    round: 0,
+  };
+}
+
+/** 从存盘记录恢复一个会话：沿用其 id 与历史，重开一份运行日志。 */
+export function resumeSession(stored: StoredSession): Session {
+  const logger = createRunLogger();
+  logger.section(`恢复会话 ${stored.id}（${stored.messages.length} 条历史）`);
+  return {
+    id: stored.id,
+    createdAt: stored.createdAt,
+    messages: stored.messages,
+    logger,
+    round: stored.messages.filter((m) => m.role === "user").length,
+  };
+}
+
+/** 把会话当前状态写盘（sessions/<id>.json），每轮结束自动调用。 */
+export function persist(session: Session): void {
+  const firstUser = session.messages.find((m) => m.role === "user");
+  const title =
+    firstUser && typeof firstUser.content === "string"
+      ? firstUser.content.slice(0, 50)
+      : "(空会话)";
+  saveSession({
+    id: session.id,
+    createdAt: session.createdAt,
+    updatedAt: new Date().toISOString(),
+    title,
+    messages: session.messages,
+  });
 }
 
 /**
@@ -274,6 +312,7 @@ export async function runAgent(
   messages.push({ role: "user", content: userInput });
   logger.section(`========== 用户输入 #${session.round} ==========`);
   logger.log(userInput);
+  persist(session); // 先记下用户这轮（即使中途被中断也不丢）
 
   // 最大轮数上限，防止模型陷入死循环（Phase 2 会再强化鲁棒性）。
   const MAX_TURNS = 10;
@@ -331,6 +370,7 @@ export async function runAgent(
           : "(模型没有返回文本内容)";
       logger.section("最终答案");
       logger.log(finalAnswer);
+      persist(session); // 落盘本轮完整结果
       return finalAnswer;
     }
 
@@ -379,5 +419,6 @@ export async function runAgent(
     // 带着新的 observation 回到循环顶部，再次 think。
   }
 
+  persist(session);
   return `已达到最大轮数上限（${MAX_TURNS}），未得到最终答案。`;
 }

@@ -2,15 +2,22 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
 import {
   runAgent,
+  createSession,
   SYSTEM_PROMPT,
   type Session,
   type Emitter,
   type ApprovalRequest,
 } from "./agent.js";
+import { listSessions } from "./store.js";
+import type OpenAI from "openai";
+
+type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 // 斜杠命令表：菜单、/help 单一来源。
 export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/help", desc: "显示帮助" },
+  { name: "/new", desc: "开一个新会话" },
+  { name: "/sessions", desc: "列出历史会话（--resume <id> 恢复）" },
   { name: "/history", desc: "打印当前历史的 role 时间线" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
@@ -85,6 +92,27 @@ function itemLines(it: Item, width: number): VLine[] {
   }
 }
 
+// 把已存的 messages 历史还原成屏幕条目（恢复会话时铺到界面上）。
+function messagesToItems(messages: Message[]): Item[] {
+  const out: Item[] = [];
+  for (const m of messages) {
+    if (m.role === "user") {
+      out.push({ kind: "user", text: typeof m.content === "string" ? m.content : "" });
+    } else if (m.role === "assistant") {
+      if (typeof m.content === "string" && m.content)
+        out.push({ kind: "assistant", text: m.content });
+      const tcs = (m as { tool_calls?: { function: { name: string; arguments: string } }[] })
+        .tool_calls;
+      if (tcs)
+        for (const tc of tcs)
+          out.push({ kind: "tool_call", name: tc.function.name, argsText: tc.function.arguments });
+    } else if (m.role === "tool") {
+      out.push({ kind: "tool_result", result: typeof m.content === "string" ? m.content : "" });
+    }
+  }
+  return out;
+}
+
 // 输入行上方的实时命令菜单：命中前缀亮绿，其余青色，随输入筛选。
 function CommandMenu({ input }: { input: string }) {
   const hits = COMMANDS.filter((c) => c.name.startsWith(input));
@@ -114,8 +142,9 @@ function App({ session }: { session: Session }) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const { setRawMode, isRawModeSupported } = useStdin();
-  const [items, setItems] = useState<Item[]>([
-    { kind: "note", text: `📝 本次会话日志: ${session.logger.path}` },
+  const [items, setItems] = useState<Item[]>(() => [
+    { kind: "note", text: `📝 会话 ${session.id} · 日志 ${session.logger.path}` },
+    ...messagesToItems(session.messages), // 恢复会话时把历史铺上来
   ]);
   const [input, setInput] = useState("");
   const [cursor, setCursor] = useState(0); // 光标在 input 中的位置（0..len）
@@ -160,6 +189,30 @@ function App({ session }: { session: Session }) {
 
       if (text === "/exit" || text === "/quit") return exit();
       if (text === "/help") return push({ kind: "note", text: HELP });
+      if (text === "/new") {
+        // 开新会话：换 id/历史/日志（旧会话已存盘，可日后 --resume 恢复）
+        const fresh = createSession();
+        session.id = fresh.id;
+        session.createdAt = fresh.createdAt;
+        session.logger = fresh.logger;
+        session.round = 0;
+        session.messages.length = 0;
+        session.messages.push(...fresh.messages);
+        setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
+        return;
+      }
+      if (text === "/sessions") {
+        const list = listSessions().slice(0, 12);
+        if (list.length === 0)
+          return push({ kind: "note", text: "（暂无历史会话）" });
+        const lines = list
+          .map((s) => `  ${s.id}${s.id === session.id ? " *当前" : ""}  ${s.title}`)
+          .join("\n");
+        return push({
+          kind: "note",
+          text: "历史会话（启动时 --resume <id> 恢复）：\n" + lines,
+        });
+      }
       if (text === "/clear") {
         session.messages.length = 0;
         session.messages.push({ role: "system", content: SYSTEM_PROMPT });
