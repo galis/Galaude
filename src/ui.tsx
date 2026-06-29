@@ -367,20 +367,11 @@ function App({ session }: { session: Session }) {
 
   const inCmd = input.startsWith("/");
   const menuRows = !busy && inCmd && !approval ? COMMANDS.length + 1 : 0;
-  // 底部区域：确认框占 3 行；否则输入框(1) + 可能的命令菜单
-  const bottomRows = approval ? 3 : 1 + menuRows;
+  // 确认框预览（命令 / diff），最多展示 14 行
+  const previewLines = approval ? approval.preview.split("\n").slice(0, 14) : [];
+  // 底部区域：确认框 = 标题(1) + 预览(n) + 提示(1)；否则输入框(1) + 命令菜单
+  const bottomRows = approval ? 2 + previewLines.length : 1 + menuRows;
   const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
-
-  // 确认框里展示真正的命令（从 {"command":"..."} 解析出来），失败就用原始参数串。
-  let approvalCmd = approval?.argsText ?? "";
-  if (approval) {
-    try {
-      const o = JSON.parse(approval.argsText) as { command?: string };
-      if (typeof o.command === "string") approvalCmd = o.command;
-    } catch {
-      /* 用原始 argsText */
-    }
-  }
 
   // 把所有内容（含正在流式的答案）摊成行，再按滚动偏移取一个窗口。
   const allLines: VLine[] = [
@@ -415,16 +406,27 @@ function App({ session }: { session: Session }) {
       </Box>
 
       {approval ? (
-        /* 工具确认门：危险工具执行前等用户拍板 */
+        /* 工具确认门：危险工具执行前等用户拍板，展示命令 / diff 预览 */
         <Box flexDirection="column">
           <Text color="yellow" bold>
-            需要确认 · 允许执行工具 {approval.name}？
+            需要确认 · 允许执行 {approval.name}？
           </Text>
-          <Text>
-            {"   "}
-            <Text color="cyan">{approvalCmd}</Text>
-          </Text>
-          <Text dimColor>{"   "}y/Enter 执行 · n/Esc 拒绝 · Ctrl+C 中断</Text>
+          {previewLines.map((l, i) => (
+            <Text
+              key={i}
+              color={
+                l.startsWith("+")
+                  ? "green"
+                  : l.startsWith("-")
+                    ? "red"
+                    : undefined
+              }
+              dimColor={!l.startsWith("+") && !l.startsWith("-")}
+            >
+              {l || " "}
+            </Text>
+          ))}
+          <Text dimColor>y/Enter 执行 · n/Esc 拒绝 · Ctrl+C 中断</Text>
         </Box>
       ) : (
         <>

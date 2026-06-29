@@ -1,6 +1,11 @@
 import type OpenAI from "openai";
 import { client, MODEL } from "./llm.js";
-import { toolSchemas, toolRegistry, needsApproval } from "./tools.js";
+import {
+  toolSchemas,
+  toolRegistry,
+  needsApproval,
+  describeForApproval,
+} from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 
@@ -24,7 +29,11 @@ export type Emitter = (ev: AgentEvent) => void;
 
 // 工具确认门（human-in-the-loop）：危险工具执行前问用户要不要跑。
 // 返回 true 执行、false 拒绝。默认放行（一次性/管道模式无人值守）。
-export type ApprovalRequest = { name: string; argsText: string };
+export type ApprovalRequest = {
+  name: string;
+  argsText: string;
+  preview: string; // 给用户看的可读预览（命令 / diff）
+};
 export type ToolApprover = (req: ApprovalRequest) => Promise<boolean>;
 const autoApprove: ToolApprover = async () => true;
 
@@ -225,11 +234,12 @@ async function streamModel(
 }
 
 export const SYSTEM_PROMPT =
-  "你是一个 AI 编程 Agent 助手，帮用户在本机完成编程相关任务。" +
-  "你可以使用工具：用 run_bash 执行 bash 命令（查看/搜索/读写文件、跑测试、git、查系统信息等），" +
-  "用 calculate 做精确计算。" +
-  "优先通过工具获取真实信息，不要凭空臆测或编造文件内容；" +
-  "多步任务就一步步调用工具推进，完成后用简洁清晰的话回答。";
+  "你是一个 AI 编程 Agent 助手，帮用户在本机完成编程相关任务。可用工具：" +
+  "read_file 读文件、write_file 写/建文件、edit_file 精确改文件" +
+  "（这三类文件操作一律用专门工具，不要用 run_bash 的 cat/echo/sed）；" +
+  "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算。" +
+  "优先用工具获取真实信息，不要凭空臆测或编造文件内容；" +
+  "多步任务一步步调用工具推进，完成后用简洁清晰的话回答。";
 
 /** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
 export interface Session {
@@ -335,21 +345,26 @@ export async function runAgent(
       emit({ type: "tool_call", name, argsText: rawArgs });
 
       let result: string;
-      // 危险工具先过用户确认门；被拒绝就把「已拒绝」当 observation 喂回，
-      // 模型据此换个做法（不直接执行，也不掀翻循环）。
-      if (needsApproval.has(name) && !(await approve({ name, argsText: rawArgs }))) {
-        result = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
-      } else {
+      // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
+      // 而不是直接抛异常掀翻整个循环。
+      try {
         const args = JSON.parse(rawArgs || "{}");
-        // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
-        // 而不是直接抛异常掀翻整个循环。模型看到错误信息后，往往能
-        // 自己换一种方式重试（比如改用别的表达式）。
-        const impl = toolRegistry[name];
-        try {
-          result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
-        } catch (err) {
-          result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
+        // 危险工具先过用户确认门（确认框带可读预览：命令 / diff）；
+        // 被拒绝就把「已拒绝」当 observation 喂回，模型据此换个做法。
+        if (needsApproval.has(name)) {
+          const preview = await describeForApproval(name, args);
+          if (!(await approve({ name, argsText: rawArgs, preview }))) {
+            result = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
+            emit({ type: "tool_result", name, result });
+            logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);
+            messages.push({ role: "tool", tool_call_id: call.id, content: result });
+            continue;
+          }
         }
+        const impl = toolRegistry[name];
+        result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
+      } catch (err) {
+        result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
       }
       emit({ type: "tool_result", name, result });
       logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);
