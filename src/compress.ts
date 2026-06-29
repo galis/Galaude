@@ -3,8 +3,20 @@ import { config } from "./config.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
-const { budget, trimFrac, summarizeFrac, keepRecentTools, keepRecentTurns, trimMin } =
-  config.compress;
+const {
+  budget,
+  trimFrac,
+  summarizeFrac,
+  keepRecentTools,
+  keepRecentTurns,
+  trimMin,
+  foldFrac,
+  foldGroupSize,
+  warnFrac,
+} = config.compress;
+
+/** 粗估 token 数（中英文混合，约 3 字符/token）。 */
+const roughTokens = (text: string) => Math.ceil(text.length / 3);
 
 /** 上下文 token 预算（窗口 W），供 UI 显示 ctx 占比。 */
 export const ctxBudget = budget;
@@ -136,4 +148,55 @@ export function applyCompaction(
 ): void {
   s.summaries.push({ range, level: 1, text });
   s.summarizedUpTo = range[1];
+}
+
+// ———————————————————— 分级折叠（层 B 触顶）：把若干旧摘要再折一层 ————————————————————
+
+/** 摘要本身占的 token 估算超过 budget*foldFrac → 该做二级折叠。 */
+export function shouldFold(s: CompressState): boolean {
+  const tok = s.summaries.reduce((n, seg) => n + roughTokens(seg.text), 0);
+  return tok > budget * foldFrac;
+}
+
+/** 当前摘要里的最高层级（0=无摘要，1=一级，2=二级…）。用于软提示判断。 */
+export function maxSummaryLevel(s: CompressState): number {
+  return s.summaries.reduce((mx, x) => Math.max(mx, x.level), 0);
+}
+
+/** ctx 偏大或出现高层摘要 → 该软提示用户。 */
+export function shouldWarn(s: CompressState): boolean {
+  return s.lastPromptTokens > budget * warnFrac || maxSummaryLevel(s) >= 2;
+}
+
+/**
+ * 选出要再折一层的「最旧、连续、同最低层级」的一组摘要段。
+ * 返回 [i, j]（含）或 null。folds 是把 segs[i..j] 这组合并成一条更高层级的段。
+ */
+export function pickFoldGroup(s: CompressState): [number, number] | null {
+  const segs = s.summaries;
+  if (segs.length < foldGroupSize) return null;
+  const minLevel = Math.min(...segs.map((x) => x.level));
+  const start = segs.findIndex((x) => x.level === minLevel);
+  if (start < 0) return null;
+  let end = start;
+  while (
+    end + 1 < segs.length &&
+    segs[end + 1]!.level === minLevel &&
+    end - start + 1 < foldGroupSize
+  )
+    end++;
+  return end - start + 1 >= foldGroupSize ? [start, end] : null;
+}
+
+/** 用合并后的文本，把 segs[i..j] 这组替换成一条更高层级的摘要段。 */
+export function applyFold(
+  s: CompressState,
+  group: [number, number],
+  text: string
+): void {
+  const [i, j] = group;
+  const segs = s.summaries;
+  const range: [number, number] = [segs[i]!.range[0], segs[j]!.range[1]];
+  const level = Math.max(...segs.slice(i, j + 1).map((x) => x.level)) + 1;
+  segs.splice(i, j - i + 1, { range, level, text });
 }
