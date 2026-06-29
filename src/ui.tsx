@@ -317,6 +317,8 @@ function App({ session }: { session: Session }) {
           push({ kind: "tool_result", result: ev.result });
         } else if (ev.type === "usage") {
           setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
+        } else if (ev.type === "note") {
+          push({ kind: "note", text: ev.text }); // 如「已折叠」提示
         }
       };
       // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
