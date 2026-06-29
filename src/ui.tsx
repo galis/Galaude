@@ -11,6 +11,7 @@ import {
   type ApprovalRequest,
 } from "./agent.js";
 import { listSessions, loadSession, type StoredSession } from "./store.js";
+import { config } from "./config.js";
 import type OpenAI from "openai";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -173,6 +174,7 @@ function App({ session }: { session: Session }) {
   );
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
+  const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
     cols: stdout.columns || 80,
@@ -198,9 +200,11 @@ function App({ session }: { session: Session }) {
       session.createdAt = ns.createdAt;
       session.logger = ns.logger;
       session.round = ns.round;
+      session.lastPromptTokens = ns.lastPromptTokens;
       session.messages.length = 0;
       session.messages.push(...ns.messages);
       setPicker(null);
+      setCtxTokens(ns.lastPromptTokens); // ctx 占比也切到目标会话
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
       setItems([
@@ -245,10 +249,12 @@ function App({ session }: { session: Session }) {
         session.createdAt = fresh.createdAt;
         session.logger = fresh.logger;
         session.round = 0;
+        session.lastPromptTokens = 0;
         session.messages.length = 0;
         session.messages.push(...fresh.messages);
         setHistory([]); // 新会话输入历史清空
         histPosRef.current = null;
+        setCtxTokens(0);
         setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
         return;
       }
@@ -309,6 +315,8 @@ function App({ session }: { session: Session }) {
           push({ kind: "tool_call", name: ev.name, argsText: ev.argsText });
         } else if (ev.type === "tool_result") {
           push({ kind: "tool_result", result: ev.result });
+        } else if (ev.type === "usage") {
+          setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
         }
       };
       // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
@@ -547,9 +555,17 @@ function App({ session }: { session: Session }) {
 
   return (
     <Box flexDirection="column" height={size.rows} width={size.cols}>
-      {/* 顶部标题栏（固定）；上滚时显示提示 */}
+      {/* 顶部标题栏（固定）；显示 ctx 占比；上滚时显示提示 */}
       <Text color="magentaBright">
-        🌀 Galaude · Ink UI —— /help 看命令，/exit 退出
+        🌀 Galaude · Ink UI —— /help，/exit
+        {ctxTokens > 0 ? (
+          <Text dimColor>
+            {"  "}ctx {Math.round((ctxTokens / config.compress.budget) * 100)}%
+            {ctxTokens > config.compress.budget * config.compress.trimFrac
+              ? " 🗜裁剪中"
+              : ""}
+          </Text>
+        ) : null}
         {off > 0 ? (
           <Text color="yellow"> ↑已上滚 {off} 行（滚到底自动跟随）</Text>
         ) : null}

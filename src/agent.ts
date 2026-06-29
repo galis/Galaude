@@ -9,6 +9,7 @@ import {
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 import { newSessionId, saveSession, type StoredSession } from "./store.js";
+import { buildContext } from "./compress.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -25,6 +26,7 @@ export type AgentEvent =
   | { type: "assistant"; text: string } // 回答正文增量
   | { type: "tool_call"; name: string; argsText: string }
   | { type: "tool_result"; name: string; result: string }
+  | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
   | { type: "debug"; text: string };
 export type Emitter = (ev: AgentEvent) => void;
 
@@ -58,6 +60,8 @@ export function makeConsoleEmitter(): Emitter {
       case "tool_result":
         console.log(`   ↳ 结果: ${ev.result}`);
         break;
+      case "usage":
+        break; // 控制台模式不显示 ctx 占比
       case "debug":
         if (DEBUG) console.log(ev.text);
         break;
@@ -249,6 +253,7 @@ export interface Session {
   messages: Message[];
   logger: RunLogger;
   round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
+  lastPromptTokens: number; // 上轮模型实际看到的 prompt token（投影大小），驱动压缩触发
 }
 
 /** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
@@ -263,6 +268,7 @@ export function createSession(): Session {
     messages,
     logger,
     round: 0,
+    lastPromptTokens: 0,
   };
 }
 
@@ -276,6 +282,8 @@ export function resumeSession(stored: StoredSession): Session {
     messages: stored.messages,
     logger,
     round: stored.messages.filter((m) => m.role === "user").length,
+    // 恢复时带上 ctx 大小：这样恢复后第一轮就知道要不要裁，不会先发一坨超大上下文
+    lastPromptTokens: stored.lastPromptTokens ?? 0,
   };
 }
 
@@ -291,6 +299,7 @@ export function persist(session: Session): void {
     updatedAt: new Date().toISOString(),
     title,
     messages: session.messages,
+    lastPromptTokens: session.lastPromptTokens,
   });
 }
 
@@ -320,13 +329,17 @@ export async function runAgent(
     emit({ type: "debug", text: `──────── 第 ${turn} 轮：调用模型 ────────` });
     // 这一轮「发出去」的历史：每轮都把完整 messages 重新传给无状态的 API。
     emit({ type: "debug", text: `📤 发送历史（${messages.length} 条）: ${timeline(messages)}` });
-    // 完整 prompt 正文（就是这次实际发给模型的 messages）写进日志文件。
-    logger.section(`第 ${turn} 轮 — 发送给模型的完整 messages（即 prompt）`);
-    logger.log(JSON.stringify(messages, null, 2));
+    // 投影：真相源 messages 的临时视图（可能裁过旧工具输出），这才是真正发给模型的。
+    // messages 本身一字不动，只是发送时套一层 buildContext。
+    const ctx = buildContext(messages, session.lastPromptTokens);
+    logger.section(
+      `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${session.lastPromptTokens} tok）`
+    );
+    logger.log(JSON.stringify(ctx, null, 2));
 
     // —— think（流式）——
     const { assistantMsg, finishReason, usage } = await streamModel(
-      messages,
+      ctx,
       logger,
       turn,
       emit,
@@ -344,6 +357,9 @@ export async function runAgent(
         )
     );
     if (usage) {
+      // 记下投影实际大小：下一次 buildContext 据此决定要不要裁（也驱动 UI 的 ctx 占比）。
+      session.lastPromptTokens = usage.prompt_tokens;
+      emit({ type: "usage", promptTokens: usage.prompt_tokens });
       emit({
         type: "debug",
         text:
