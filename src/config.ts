@@ -52,5 +52,8 @@ export const config = {
     keepRecentTools: envNum("CTX_KEEP_TOOLS", 4), // 最近几条 role:tool 输出留全
     keepRecentTurns: envNum("CTX_KEEP_TURNS", 3), // 最近几轮原文不折叠
     trimMin: envNum("CTX_TRIM_MIN", 300), // content 超过多少字符才值得裁
+    foldFrac: envNum("CTX_FOLD_FRAC", 0.25), // 摘要本身 token 占比超此 → 二级折叠（层 B 触顶）
+    foldGroupSize: envNum("CTX_FOLD_GROUP", 4), // 每次把几段旧摘要再折一层
+    warnFrac: envNum("CTX_WARN_FRAC", 0.85), // ctx 超此 / 出现高层摘要 → 软提示
   },
 };

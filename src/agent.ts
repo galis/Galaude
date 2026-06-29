@@ -14,6 +14,10 @@ import {
   shouldCompact,
   pickCompactionRange,
   applyCompaction,
+  shouldFold,
+  pickFoldGroup,
+  applyFold,
+  shouldWarn,
   type SummarySegment,
 } from "./compress.js";
 
@@ -353,22 +357,86 @@ function renderTranscript(slice: Message[]): string {
     .join("\n");
 }
 
-/** 折叠摘要的那一次 LLM 调用（非流式、稀疏）。从原文摘 → 不漂移。 */
-async function summarizeChunk(slice: Message[]): Promise<string> {
+/**
+ * 折叠那一次 LLM 调用（非流式、稀疏）。从原文摘 → 不漂移。
+ * 顺带抽取「需长期记住的稳定事实」放进外置记忆（层 C），用 JSON 输出，防御式解析。
+ */
+async function summarizeChunk(
+  slice: Message[]
+): Promise<{ summary: string; facts: string[] }> {
   const res = await client.chat.completions.create({
     model: MODEL,
     messages: [
       {
         role: "system",
         content:
-          "你是对话摘要器。把给定的对话片段浓缩成简洁的中文要点，务必保留：" +
-          "用户目标/决定、涉及的文件路径与具体改动、执行过的命令与结果、关键事实与报错信息。" +
-          "不要遗漏硬信息，不要编造。只输出摘要正文，不要客套。",
+          "你是对话摘要器。只输出一个 JSON 对象，形如 " +
+          '{"summary": "...", "facts": ["..."]}。' +
+          "summary：把这段对话浓缩成简洁中文要点，保留用户目标/决定、文件路径与改动、" +
+          "命令与结果、关键事实与报错。facts：需长期记住的稳定事实（用户偏好/项目约定/" +
+          "关键决定/身份信息等），没有就空数组。不要编造，不要客套。",
       },
-      { role: "user", content: "请摘要以下对话片段：\n\n" + renderTranscript(slice) },
+      { role: "user", content: "对话片段：\n\n" + renderTranscript(slice) },
     ],
   });
-  return res.choices[0]?.message?.content?.trim() || "(摘要为空)";
+  const raw = res.choices[0]?.message?.content?.trim() ?? "";
+  try {
+    const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
+      summary?: unknown;
+      facts?: unknown;
+    };
+    const summary = String(o.summary ?? "").trim() || "(摘要为空)";
+    const facts = Array.isArray(o.facts)
+      ? o.facts.map((f) => String(f).trim()).filter(Boolean)
+      : [];
+    return { summary, facts };
+  } catch {
+    return { summary: raw || "(摘要为空)", facts: [] }; // 不是 JSON 就当纯摘要
+  }
+}
+
+/** 把若干旧摘要再合并浓缩成更高层级的一条（分级折叠的那次 LLM 调用）。 */
+async function summarizeTexts(texts: string[]): Promise<string> {
+  const res = await client.chat.completions.create({
+    model: MODEL,
+    messages: [
+      {
+        role: "system",
+        content:
+          "把下面多段对话摘要进一步合并、浓缩成一段更短的要点，保留最重要的目标/决定/" +
+          "文件/结论，丢弃细枝末节。只输出合并后的摘要正文。",
+      },
+      {
+        role: "user",
+        content: texts.map((t, i) => `[摘要${i + 1}]\n${t}`).join("\n\n"),
+      },
+    ],
+  });
+  return res.choices[0]?.message?.content?.trim() || texts.join(" / ");
+}
+
+/** 分级折叠（层 B 触顶）：摘要本身太大时，把最旧的若干段再折一层，必要时软提示。 */
+async function maybeFold(session: Session, emit: Emitter): Promise<void> {
+  while (shouldFold(session)) {
+    const group = pickFoldGroup(session);
+    if (!group) break;
+    const texts = session.summaries.slice(group[0], group[1] + 1).map((x) => x.text);
+    const text = await summarizeTexts(texts);
+    applyFold(session, group, text);
+    session.logger.section(`🗜🗜 二级折叠 摘要段[${group[0]}..${group[1]}]`);
+    session.logger.log(text);
+    persist(session);
+    emit({
+      type: "note",
+      text: `🗜 摘要过多，已把 ${group[1] - group[0] + 1} 段旧摘要再折一层`,
+    });
+  }
+  if (shouldWarn(session)) {
+    emit({
+      type: "note",
+      text: "⚠️ 对话很长、早期内容已重度压缩，关键信息可能丢失；可 /new 开一个聚焦的新会话",
+    });
+  }
 }
 
 /** 轮边界检查：上下文偏大时，把最旧的若干完整轮折叠成一段摘要（一次 LLM 调用）。 */
@@ -381,17 +449,24 @@ async function maybeCompact(session: Session, emit: Emitter): Promise<void> {
     type: "debug",
     text: `🗜 折叠 messages[${range[0]}..${range[1]}]（${slice.length} 条）成摘要 …`,
   });
-  const text = await summarizeChunk(slice);
-  applyCompaction(session, range, text);
+  const { summary, facts } = await summarizeChunk(slice);
+  applyCompaction(session, range, summary);
+  for (const f of facts)
+    if (!session.memory.includes(f)) session.memory.push(f); // 外置记忆去重追加
   session.logger.section(
-    `🗜 折叠摘要 messages[${range[0]}..${range[1]}]（${slice.length} 条）`
+    `🗜 折叠摘要 messages[${range[0]}..${range[1]}]（${slice.length} 条）` +
+      (facts.length ? `；抽取事实 ${facts.length} 条` : "")
   );
-  session.logger.log(text);
-  persist(session); // 摘要 + 水位线落盘（之后恢复直接读，零重放）
+  session.logger.log(summary + (facts.length ? "\n事实:\n- " + facts.join("\n- ") : ""));
+  persist(session); // 摘要 + 水位线 + 记忆落盘（之后恢复直接读，零重放）
   emit({
     type: "note",
-    text: `🗜 已把早前 ${slice.length} 条消息折叠成摘要（ctx 下降）`,
+    text:
+      `🗜 已把早前 ${slice.length} 条消息折叠成摘要` +
+      (facts.length ? `，记住 ${facts.length} 条事实` : "") +
+      "（ctx 下降）",
   });
+  await maybeFold(session, emit); // 摘要本身若过大，再折一层
 }
 
 /**
