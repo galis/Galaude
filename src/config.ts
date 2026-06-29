@@ -56,4 +56,14 @@ export const config = {
     foldGroupSize: envNum("CTX_FOLD_GROUP", 4), // 每次把几段旧摘要再折一层
     warnFrac: envNum("CTX_WARN_FRAC", 0.85), // ctx 超此 / 出现高层摘要 → 软提示
   },
+
+  /**
+   * 确认门模式（env: APPROVAL_MODE）。
+   *   auto（默认）：危险工具先让模型判风险，只有判为「有风险」才弹确认框。
+   *   strict：危险工具（needsApproval）一律弹确认框。
+   * 运行中可用 /mode 切换。
+   */
+  approvalMode: (process.env.APPROVAL_MODE === "strict" ? "strict" : "auto") as
+    | "auto"
+    | "strict",
 };

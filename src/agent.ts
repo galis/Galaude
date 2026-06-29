@@ -51,6 +51,14 @@ export type ApprovalRequest = {
 export type ToolApprover = (req: ApprovalRequest) => Promise<boolean>;
 const autoApprove: ToolApprover = async () => true;
 
+// 确认门模式（进程级运行时设置，默认取 config，可用 /mode 切换）。
+export type ApprovalMode = "auto" | "strict";
+let approvalMode: ApprovalMode = config.approvalMode;
+export const getApprovalMode = (): ApprovalMode => approvalMode;
+export const setApprovalMode = (m: ApprovalMode): void => {
+  approvalMode = m;
+};
+
 /** 默认事件渲染：写到控制台（一次性 / 管道模式用），尽量还原老输出。 */
 export function makeConsoleEmitter(): Emitter {
   let answerStarted = false;
@@ -395,6 +403,44 @@ async function summarizeChunk(
   }
 }
 
+/**
+ * auto 模式下让模型判断这个工具调用是否「有风险」。
+ * 防御式 JSON 解析；判不出来（解析失败/异常）→ 保守当作有风险（fail-safe）。
+ */
+async function judgeRisk(
+  name: string,
+  args: Record<string, unknown>
+): Promise<{ risky: boolean; reason: string }> {
+  try {
+    const res = await client.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "你是工具调用风险判官。判断给定工具调用是否「有风险」。" +
+            "有风险=破坏性/不可逆（rm、删除、覆盖重要文件、git reset --hard / git push、drop、清空目录）、" +
+            "提权或改系统（sudo、改系统配置或环境变量）、对外发数据/下载执行（curl|sh、上传、外联）、大范围批量改动。" +
+            "低风险=只读或查询（ls、cat、grep、git status/diff、find）、构建测试、常规单文件编辑、echo、mkdir。" +
+            '只输出 JSON：{"risky": true 或 false, "reason": "一句话中文理由"}。',
+        },
+        { role: "user", content: `工具: ${name}\n参数: ${JSON.stringify(args)}` },
+      ],
+    });
+    const raw = res.choices[0]?.message?.content?.trim() ?? "";
+    const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
+      risky?: unknown;
+      reason?: unknown;
+    };
+    return {
+      risky: Boolean(o.risky),
+      reason: String(o.reason ?? "").trim() || "(无说明)",
+    };
+  } catch {
+    return { risky: true, reason: "风险判定失败，保守起见需确认" };
+  }
+}
+
 /** 把若干旧摘要再合并浓缩成更高层级的一条（分级折叠的那次 LLM 调用）。 */
 async function summarizeTexts(texts: string[]): Promise<string> {
   const res = await client.chat.completions.create({
@@ -575,22 +621,48 @@ export async function runAgent(
     const results: (string | null)[] = toolCalls.map(() => null);
     const parsed: (Record<string, unknown> | null)[] = toolCalls.map(() => null);
 
-    // 阶段 2：串行解析 + 审批（一次只弹一个确认框）
+    // 阶段 2a：解析参数（即时）
     for (let i = 0; i < toolCalls.length; i++) {
-      const { name, arguments: rawArgs } = toolCalls[i]!.function;
-      let args: Record<string, unknown>;
+      const rawArgs = toolCalls[i]!.function.arguments;
       try {
-        args = JSON.parse(rawArgs || "{}");
+        parsed[i] = JSON.parse(rawArgs || "{}");
       } catch (err) {
         results[i] = `工具执行出错：参数不是合法 JSON（${err instanceof Error ? err.message : String(err)}）`;
-        continue;
       }
-      parsed[i] = args;
-      if (needsApproval.has(name)) {
-        const preview = await describeForApproval(name, args);
-        if (!(await approve({ name, argsText: rawArgs, preview })))
-          results[i] = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
-      }
+    }
+
+    // 阶段 2b：判定每个危险工具要不要确认。无人值守(autoApprove)直接放行；
+    // strict：危险工具一律确认；auto：让模型判风险（可并行判），只有有风险才确认。
+    const interactive = approve !== autoApprove;
+    const needConfirm: boolean[] = toolCalls.map(() => false);
+    const riskReason: string[] = toolCalls.map(() => "");
+    if (interactive) {
+      await Promise.all(
+        toolCalls.map(async (call, i) => {
+          const name = call.function.name;
+          if (results[i] !== null || !needsApproval.has(name)) return; // 出错的/安全工具：免确认
+          if (approvalMode === "strict") {
+            needConfirm[i] = true;
+            return;
+          }
+          const { risky, reason } = await judgeRisk(name, parsed[i]!);
+          needConfirm[i] = risky;
+          riskReason[i] = reason;
+          if (!risky)
+            emit({ type: "note", text: `✓ 自动放行 ${name}（低风险：${reason}）` });
+        })
+      );
+    }
+
+    // 阶段 2c：串行弹确认框（只对 needConfirm 的；一次一个；带风险理由）
+    for (let i = 0; i < toolCalls.length; i++) {
+      if (results[i] !== null || !needConfirm[i]) continue;
+      const { name, arguments: rawArgs } = toolCalls[i]!.function;
+      const preview =
+        (riskReason[i] ? `[风险] 模型判定：${riskReason[i]}\n` : "") +
+        (await describeForApproval(name, parsed[i]!));
+      if (!(await approve({ name, argsText: rawArgs, preview })))
+        results[i] = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
     }
 
     // 阶段 3：并行执行（只跑还没定结果的；各自 try/catch；完成即 emit，乱序但带名字）

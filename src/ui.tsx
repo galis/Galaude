@@ -5,6 +5,8 @@ import {
   createSession,
   resumeSession,
   persist,
+  getApprovalMode,
+  setApprovalMode,
   SYSTEM_PROMPT,
   type Session,
   type Emitter,
@@ -25,6 +27,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/sessions", desc: "列出历史会话" },
   { name: "/history", desc: "打印当前历史的 role 时间线" },
   { name: "/context", desc: "显示当前上下文占用情况" },
+  { name: "/mode", desc: "切换确认模式 auto（判风险才确认）/ strict（一律确认）" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
 ];
@@ -177,6 +180,7 @@ function App({ session }: { session: Session }) {
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
+  const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
     cols: stdout.columns || 80,
@@ -301,6 +305,24 @@ function App({ session }: { session: Session }) {
       }
       if (text === "/context") {
         return push({ kind: "note", text: contextReport(session) });
+      }
+      if (text === "/mode" || text.startsWith("/mode ")) {
+        const arg = text.slice(5).trim();
+        const next =
+          arg === "auto" || arg === "strict"
+            ? arg
+            : mode === "auto"
+              ? "strict"
+              : "auto";
+        setApprovalMode(next);
+        setMode(next);
+        return push({
+          kind: "note",
+          text:
+            next === "auto"
+              ? "🔁 确认模式：auto —— 危险工具先让模型判风险，只有有风险才确认"
+              : "🔁 确认模式：strict —— 危险工具（run_bash/write_file/edit_file）一律确认",
+        });
       }
       if (text.startsWith("/"))
         return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
@@ -565,6 +587,7 @@ function App({ session }: { session: Session }) {
       {/* 顶部标题栏（固定）；显示 ctx 占比；上滚时显示提示 */}
       <Text color="magentaBright">
         🌀 Galaude · Ink UI —— /help，/exit
+        <Text color={mode === "auto" ? "green" : "yellow"}> [{mode}]</Text>
         {ctxTokens > 0 ? (
           <Text dimColor>
             {"  "}ctx {Math.round((ctxTokens / config.compress.budget) * 100)}%
