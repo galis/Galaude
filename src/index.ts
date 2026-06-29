@@ -2,6 +2,7 @@ import "dotenv/config";
 import { createInterface } from "node:readline/promises";
 import { createSession, resumeSession, runAgent } from "./agent.js";
 import { latestSession, loadSession } from "./store.js";
+import { contextReport } from "./compress.js";
 import { renderUI, HELP } from "./ui.js";
 
 // 参数解析：
@@ -60,6 +61,10 @@ if (process.stdin.isTTY) {
     if (!text) continue;
     if (text === "/help") {
       console.log(HELP + "\n");
+      continue;
+    }
+    if (text === "/context") {
+      console.log(contextReport(session) + "\n");
       continue;
     }
     try {
