@@ -59,6 +59,10 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   },
 ];
 
+// 需要先经用户确认才执行的「危险」工具（有副作用 / 能跑任意命令）。
+// calculate 是纯计算、无副作用，不需要确认。
+export const needsApproval = new Set<string>(["run_bash"]);
+
 // —— 2. 实现：工具名 → 本地函数 的注册表 ——
 // 每个实现接收「已解析好的参数对象」，返回一个字符串（喂回给模型当 observation）。
 // 允许返回 Promise：像 run_bash 这种 IO 工具必须异步，否则会卡死事件循环（UI 冻结）。

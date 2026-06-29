@@ -1,6 +1,6 @@
 import type OpenAI from "openai";
 import { client, MODEL } from "./llm.js";
-import { toolSchemas, toolRegistry } from "./tools.js";
+import { toolSchemas, toolRegistry, needsApproval } from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 
@@ -21,6 +21,12 @@ export type AgentEvent =
   | { type: "tool_result"; name: string; result: string }
   | { type: "debug"; text: string };
 export type Emitter = (ev: AgentEvent) => void;
+
+// 工具确认门（human-in-the-loop）：危险工具执行前问用户要不要跑。
+// 返回 true 执行、false 拒绝。默认放行（一次性/管道模式无人值守）。
+export type ApprovalRequest = { name: string; argsText: string };
+export type ToolApprover = (req: ApprovalRequest) => Promise<boolean>;
+const autoApprove: ToolApprover = async () => true;
 
 /** 默认事件渲染：写到控制台（一次性 / 管道模式用），尽量还原老输出。 */
 export function makeConsoleEmitter(): Emitter {
@@ -250,7 +256,8 @@ export async function runAgent(
   session: Session,
   userInput: string,
   emit: Emitter = makeConsoleEmitter(),
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  approve: ToolApprover = autoApprove
 ): Promise<string> {
   const { messages, logger } = session;
   session.round++;
@@ -325,18 +332,24 @@ export async function runAgent(
     // —— act + observe：逐个执行模型请求的工具 ——
     for (const call of toolCalls) {
       const { name, arguments: rawArgs } = call.function;
-      const args = JSON.parse(rawArgs || "{}");
       emit({ type: "tool_call", name, argsText: rawArgs });
 
-      // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
-      // 而不是直接抛异常掀翻整个循环。模型看到错误信息后，往往能
-      // 自己换一种方式重试（比如改用别的表达式）。
-      const impl = toolRegistry[name];
       let result: string;
-      try {
-        result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
-      } catch (err) {
-        result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
+      // 危险工具先过用户确认门；被拒绝就把「已拒绝」当 observation 喂回，
+      // 模型据此换个做法（不直接执行，也不掀翻循环）。
+      if (needsApproval.has(name) && !(await approve({ name, argsText: rawArgs }))) {
+        result = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
+      } else {
+        const args = JSON.parse(rawArgs || "{}");
+        // 工具执行包 try/catch：报错也当成一种「观察结果」喂回给模型，
+        // 而不是直接抛异常掀翻整个循环。模型看到错误信息后，往往能
+        // 自己换一种方式重试（比如改用别的表达式）。
+        const impl = toolRegistry[name];
+        try {
+          result = impl ? await impl(args) : `错误：未知工具 "${name}"`;
+        } catch (err) {
+          result = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
+        }
       }
       emit({ type: "tool_result", name, result });
       logger.log(`[tool] ${name}(${rawArgs}) => ${result}`);

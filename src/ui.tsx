@@ -5,6 +5,7 @@ import {
   SYSTEM_PROMPT,
   type Session,
   type Emitter,
+  type ApprovalRequest,
 } from "./agent.js";
 
 // 斜杠命令表：菜单、/help 单一来源。
@@ -125,6 +126,8 @@ function App({ session }: { session: Session }) {
     rows: stdout.rows || 24,
   });
   const abortRef = useRef<AbortController | null>(null); // 当前生成的中断器
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null); // 待确认的工具
+  const approveResolveRef = useRef<((ok: boolean) => void) | null>(null);
 
   // 跟随终端尺寸变化（备用屏进入/退出在 renderUI 里）。
   useEffect(() => {
@@ -181,8 +184,14 @@ function App({ session }: { session: Session }) {
           push({ kind: "tool_result", result: ev.result });
         }
       };
+      // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
+      const approve = (req: ApprovalRequest) =>
+        new Promise<boolean>((resolve) => {
+          approveResolveRef.current = resolve;
+          setApproval(req);
+        });
       try {
-        const answer = await runAgent(session, text, emit, ac.signal);
+        const answer = await runAgent(session, text, emit, ac.signal, approve);
         // 中断时流可能「优雅结束」（不抛错）：保留已生成的部分，并标注已中断。
         if (ac.signal.aborted) {
           if (answer.trim()) push({ kind: "assistant", text: answer });
@@ -237,10 +246,30 @@ function App({ session }: { session: Session }) {
       for (const ch of s) {
         const code = ch.codePointAt(0)!;
         if (code === 3) {
-          // Ctrl+C：生成中 → 中断本次生成回到输入；空闲 → 退出
-          if (busyRef.current && abortRef.current) abortRef.current.abort();
+          // Ctrl+C：等待确认 → 拒绝并中断；生成中 → 中断；空闲 → 退出
+          if (approveResolveRef.current) {
+            const r = approveResolveRef.current;
+            approveResolveRef.current = null;
+            setApproval(null);
+            r(false);
+            abortRef.current?.abort();
+          } else if (busyRef.current && abortRef.current) abortRef.current.abort();
           else exit();
           return;
+        }
+        // 工具确认门待回应：拦截 y/n/Enter/Esc，其它键忽略
+        if (approveResolveRef.current) {
+          const r = approveResolveRef.current;
+          if (ch === "y" || ch === "Y" || ch === "\r" || ch === "\n") {
+            approveResolveRef.current = null;
+            setApproval(null);
+            r(true);
+          } else if (ch === "n" || ch === "N" || code === 27) {
+            approveResolveRef.current = null;
+            setApproval(null);
+            r(false);
+          }
+          continue;
         }
         if (busyRef.current) continue; // 处理中只接受滚动 / Ctrl+C
         if (ch === "\r" || ch === "\n") submitRef.current(inputRef.current);
@@ -258,8 +287,21 @@ function App({ session }: { session: Session }) {
   }, [stdout, setRawMode, isRawModeSupported, exit]);
 
   const inCmd = input.startsWith("/");
-  const menuRows = !busy && inCmd ? COMMANDS.length + 1 : 0;
-  const contentRows = Math.max(1, size.rows - 2 /*标题+输入*/ - menuRows);
+  const menuRows = !busy && inCmd && !approval ? COMMANDS.length + 1 : 0;
+  // 底部区域：确认框占 3 行；否则输入框(1) + 可能的命令菜单
+  const bottomRows = approval ? 3 : 1 + menuRows;
+  const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
+
+  // 确认框里展示真正的命令（从 {"command":"..."} 解析出来），失败就用原始参数串。
+  let approvalCmd = approval?.argsText ?? "";
+  if (approval) {
+    try {
+      const o = JSON.parse(approval.argsText) as { command?: string };
+      if (typeof o.command === "string") approvalCmd = o.command;
+    } catch {
+      /* 用原始 argsText */
+    }
+  }
 
   // 把所有内容（含正在流式的答案）摊成行，再按滚动偏移取一个窗口。
   const allLines: VLine[] = [
@@ -293,18 +335,34 @@ function App({ session }: { session: Session }) {
         ))}
       </Box>
 
-      {/* 命令菜单（仅在输入以 / 开头时） */}
-      {!busy && inCmd ? <CommandMenu input={input} /> : null}
+      {approval ? (
+        /* 工具确认门：危险工具执行前等用户拍板 */
+        <Box flexDirection="column">
+          <Text color="yellow" bold>
+            需要确认 · 允许执行工具 {approval.name}？
+          </Text>
+          <Text>
+            {"   "}
+            <Text color="cyan">{approvalCmd}</Text>
+          </Text>
+          <Text dimColor>{"   "}y/Enter 执行 · n/Esc 拒绝 · Ctrl+C 中断</Text>
+        </Box>
+      ) : (
+        <>
+          {/* 命令菜单（仅在输入以 / 开头时） */}
+          {!busy && inCmd ? <CommandMenu input={input} /> : null}
 
-      {/* 输入框：永远是最后一行 = 终端最底部。光标块紧跟 "> " 之后 */}
-      <Box>
-        <Text color="cyan">💬 {"> "}</Text>
-        <Text>{input}</Text>
-        {!busy ? <Text inverse> </Text> : null}
-        {!input && !busy ? (
-          <Text dimColor>输入问题，/help 看命令，/exit 退出</Text>
-        ) : null}
-      </Box>
+          {/* 输入框：永远是最后一行 = 终端最底部。光标块紧跟 "> " 之后 */}
+          <Box>
+            <Text color="cyan">💬 {"> "}</Text>
+            <Text>{input}</Text>
+            {!busy ? <Text inverse> </Text> : null}
+            {!input && !busy ? (
+              <Text dimColor>输入问题，/help 看命令，/exit 退出</Text>
+            ) : null}
+          </Box>
+        </>
+      )}
     </Box>
   );
 }
