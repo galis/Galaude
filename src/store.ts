@@ -6,6 +6,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type OpenAI from "openai";
+import type { SummarySegment } from "./compress.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -20,6 +21,10 @@ export interface StoredSession {
   title: string; // 取首条用户消息，方便 /sessions 里辨认
   messages: Message[];
   lastPromptTokens?: number; // 上轮投影大小；恢复后据此立刻判断是否要裁
+  // —— 压缩状态（贵的产物缓存进 JSON → 恢复零重放）——
+  summaries?: SummarySegment[];
+  summarizedUpTo?: number;
+  memory?: string[];
 }
 
 const pad = (n: number, w = 2) => String(n).padStart(w, "0");

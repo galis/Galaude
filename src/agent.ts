@@ -9,7 +9,13 @@ import {
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 import { newSessionId, saveSession, type StoredSession } from "./store.js";
-import { buildContext } from "./compress.js";
+import {
+  buildContext,
+  shouldCompact,
+  pickCompactionRange,
+  applyCompaction,
+  type SummarySegment,
+} from "./compress.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -27,6 +33,7 @@ export type AgentEvent =
   | { type: "tool_call"; name: string; argsText: string }
   | { type: "tool_result"; name: string; result: string }
   | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
+  | { type: "note"; text: string } // 系统提示（如「已折叠」），界面当一条 note 显示
   | { type: "debug"; text: string };
 export type Emitter = (ev: AgentEvent) => void;
 
@@ -62,6 +69,9 @@ export function makeConsoleEmitter(): Emitter {
         break;
       case "usage":
         break; // 控制台模式不显示 ctx 占比
+      case "note":
+        console.log(ev.text);
+        break;
       case "debug":
         if (DEBUG) console.log(ev.text);
         break;
@@ -254,6 +264,10 @@ export interface Session {
   logger: RunLogger;
   round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
   lastPromptTokens: number; // 上轮模型实际看到的 prompt token（投影大小），驱动压缩触发
+  // —— 压缩状态（投影用，messages 始终完整不动）——
+  summaries: SummarySegment[]; // 旧段摘要，append-only
+  summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
+  memory: string[]; // 外置关键事实，豁免压缩（P3 自动抽取；现可手动用）
 }
 
 /** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
@@ -269,6 +283,9 @@ export function createSession(): Session {
     logger,
     round: 0,
     lastPromptTokens: 0,
+    summaries: [],
+    summarizedUpTo: 0,
+    memory: [],
   };
 }
 
@@ -284,6 +301,10 @@ export function resumeSession(stored: StoredSession): Session {
     round: stored.messages.filter((m) => m.role === "user").length,
     // 恢复时带上 ctx 大小：这样恢复后第一轮就知道要不要裁，不会先发一坨超大上下文
     lastPromptTokens: stored.lastPromptTokens ?? 0,
+    // 压缩状态直接读回（零重放）：摘要/水位线/记忆都是固化好的
+    summaries: stored.summaries ?? [],
+    summarizedUpTo: stored.summarizedUpTo ?? 0,
+    memory: stored.memory ?? [],
   };
 }
 
@@ -300,6 +321,76 @@ export function persist(session: Session): void {
     title,
     messages: session.messages,
     lastPromptTokens: session.lastPromptTokens,
+    summaries: session.summaries,
+    summarizedUpTo: session.summarizedUpTo,
+    memory: session.memory,
+  });
+}
+
+/** 把一段消息渲染成可读「对话稿」喂给摘要器（工具结果截断，控制摘要输入大小）。 */
+function renderTranscript(slice: Message[]): string {
+  return slice
+    .map((m) => {
+      if (m.role === "user")
+        return `用户: ${typeof m.content === "string" ? m.content : ""}`;
+      if (m.role === "assistant") {
+        const tcs = (m as AssistantParam).tool_calls;
+        const calls = tcs
+          ? tcs
+              .map((t) => `〔调用 ${t.function.name}(${t.function.arguments})〕`)
+              .join(" ")
+          : "";
+        const text = typeof m.content === "string" ? m.content : "";
+        return `助手: ${text} ${calls}`.trim();
+      }
+      if (m.role === "tool") {
+        const c = typeof m.content === "string" ? m.content : "";
+        return `工具结果: ${c.length > 1500 ? c.slice(0, 1500) + "…" : c}`;
+      }
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** 折叠摘要的那一次 LLM 调用（非流式、稀疏）。从原文摘 → 不漂移。 */
+async function summarizeChunk(slice: Message[]): Promise<string> {
+  const res = await client.chat.completions.create({
+    model: MODEL,
+    messages: [
+      {
+        role: "system",
+        content:
+          "你是对话摘要器。把给定的对话片段浓缩成简洁的中文要点，务必保留：" +
+          "用户目标/决定、涉及的文件路径与具体改动、执行过的命令与结果、关键事实与报错信息。" +
+          "不要遗漏硬信息，不要编造。只输出摘要正文，不要客套。",
+      },
+      { role: "user", content: "请摘要以下对话片段：\n\n" + renderTranscript(slice) },
+    ],
+  });
+  return res.choices[0]?.message?.content?.trim() || "(摘要为空)";
+}
+
+/** 轮边界检查：上下文偏大时，把最旧的若干完整轮折叠成一段摘要（一次 LLM 调用）。 */
+async function maybeCompact(session: Session, emit: Emitter): Promise<void> {
+  if (!shouldCompact(session)) return;
+  const range = pickCompactionRange(session);
+  if (!range) return;
+  const slice = session.messages.slice(range[0], range[1] + 1);
+  emit({
+    type: "debug",
+    text: `🗜 折叠 messages[${range[0]}..${range[1]}]（${slice.length} 条）成摘要 …`,
+  });
+  const text = await summarizeChunk(slice);
+  applyCompaction(session, range, text);
+  session.logger.section(
+    `🗜 折叠摘要 messages[${range[0]}..${range[1]}]（${slice.length} 条）`
+  );
+  session.logger.log(text);
+  persist(session); // 摘要 + 水位线落盘（之后恢复直接读，零重放）
+  emit({
+    type: "note",
+    text: `🗜 已把早前 ${slice.length} 条消息折叠成摘要（ctx 下降）`,
   });
 }
 
@@ -322,6 +413,9 @@ export async function runAgent(
   logger.log(userInput);
   persist(session); // 先记下用户这轮（即使中途被中断也不丢）
 
+  // 轮边界：上下文偏大就先把最旧的若干完整轮折叠成摘要，再开始这一轮（不折当前在飞轮）。
+  await maybeCompact(session, emit);
+
   // 最大轮数上限，防止模型陷入死循环（Phase 2 会再强化鲁棒性）。
   const MAX_TURNS = 10;
 
@@ -329,9 +423,9 @@ export async function runAgent(
     emit({ type: "debug", text: `──────── 第 ${turn} 轮：调用模型 ────────` });
     // 这一轮「发出去」的历史：每轮都把完整 messages 重新传给无状态的 API。
     emit({ type: "debug", text: `📤 发送历史（${messages.length} 条）: ${timeline(messages)}` });
-    // 投影：真相源 messages 的临时视图（可能裁过旧工具输出），这才是真正发给模型的。
-    // messages 本身一字不动，只是发送时套一层 buildContext。
-    const ctx = buildContext(messages, session.lastPromptTokens);
+    // 投影：真相源 messages 的临时视图（外置记忆 + 旧段摘要 + 近段原文，近段里偏旧的大
+    // 工具输出再裁一道）。messages 本身一字不动，只是发送时套一层 buildContext。
+    const ctx = buildContext(session);
     logger.section(
       `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${session.lastPromptTokens} tok）`
     );
