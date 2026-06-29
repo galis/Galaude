@@ -95,6 +95,22 @@ function itemLines(it: Item, width: number): VLine[] {
   }
 }
 
+// 取一组字符串的最长公共前缀（Tab 补全多个候选时用）。
+function commonPrefix(arr: string[]): string {
+  if (arr.length === 0) return "";
+  let pre = arr[0]!;
+  for (const s of arr) while (!s.startsWith(pre)) pre = pre.slice(0, -1);
+  return pre;
+}
+
+// 从 messages 里取出用户说过的话（绑定到 session 的输入历史）。
+function userTexts(messages: Message[]): string[] {
+  return messages
+    .filter((m) => m.role === "user")
+    .map((m) => (typeof m.content === "string" ? m.content : ""))
+    .filter(Boolean);
+}
+
 // 把已存的 messages 历史还原成屏幕条目（恢复会话时铺到界面上）。
 function messagesToItems(messages: Message[]): Item[] {
   const out: Item[] = [];
@@ -151,7 +167,10 @@ function App({ session }: { session: Session }) {
   ]);
   const [input, setInput] = useState("");
   const [cursor, setCursor] = useState(0); // 光标在 input 中的位置（0..len）
-  const [history, setHistory] = useState<string[]>([]); // 已提交的输入历史
+  // 输入历史绑定当前会话：初始就用会话里说过的话（恢复会话时也能 ↑ 翻）
+  const [history, setHistory] = useState<string[]>(() =>
+    userTexts(session.messages)
+  );
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
@@ -182,6 +201,8 @@ function App({ session }: { session: Session }) {
       session.messages.length = 0;
       session.messages.push(...ns.messages);
       setPicker(null);
+      setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
+      histPosRef.current = null;
       setItems([
         { kind: "note", text: `↩️ 已切换到会话 ${ns.id}（${ns.messages.length} 条历史）` },
         ...messagesToItems(ns.messages),
@@ -226,6 +247,8 @@ function App({ session }: { session: Session }) {
         session.round = 0;
         session.messages.length = 0;
         session.messages.push(...fresh.messages);
+        setHistory([]); // 新会话输入历史清空
+        histPosRef.current = null;
         setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
         return;
       }
@@ -457,6 +480,17 @@ function App({ session }: { session: Session }) {
           if (cur > 0) {
             inp = inp.slice(0, cur - 1) + inp.slice(cur); // 删光标前一个字
             cur -= 1;
+            touched = true;
+          }
+        } else if (code === 9) {
+          // Tab：补全斜杠命令（唯一匹配补全整条，多个补到公共前缀）
+          if (inp.startsWith("/")) {
+            const names = COMMANDS.map((c) => c.name).filter((n) =>
+              n.startsWith(inp)
+            );
+            if (names.length === 1) inp = names[0]!;
+            else if (names.length > 1) inp = commonPrefix(names);
+            cur = inp.length;
             touched = true;
           }
         } else if (code >= 32) {
