@@ -118,6 +118,8 @@ function App({ session }: { session: Session }) {
     { kind: "note", text: `📝 本次会话日志: ${session.logger.path}` },
   ]);
   const [input, setInput] = useState("");
+  const [cursor, setCursor] = useState(0); // 光标在 input 中的位置（0..len）
+  const [history, setHistory] = useState<string[]>([]); // 已提交的输入历史
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
@@ -128,6 +130,8 @@ function App({ session }: { session: Session }) {
   const abortRef = useRef<AbortController | null>(null); // 当前生成的中断器
   const [approval, setApproval] = useState<ApprovalRequest | null>(null); // 待确认的工具
   const approveResolveRef = useRef<((ok: boolean) => void) | null>(null);
+  const histPosRef = useRef<number | null>(null); // 当前浏览到的历史下标；null=未浏览
+  const draftRef = useRef(""); // 进入历史浏览前暂存的草稿
 
   // 跟随终端尺寸变化（备用屏进入/退出在 renderUI 里）。
   useEffect(() => {
@@ -146,8 +150,13 @@ function App({ session }: { session: Session }) {
       if (busy) return;
       const text = raw.trim();
       setInput("");
+      setCursor(0);
       setScroll(0); // 提交即回到底部跟随
+      histPosRef.current = null; // 退出历史浏览
+      draftRef.current = "";
       if (!text) return;
+      // 记录到输入历史（连续重复不重复记）
+      setHistory((h) => (h[h.length - 1] === text ? h : [...h, text]));
 
       if (text === "/exit" || text === "/quit") return exit();
       if (text === "/help") return push({ kind: "note", text: HELP });
@@ -218,10 +227,14 @@ function App({ session }: { session: Session }) {
   // 用 ref 让 stdin 监听器始终拿到最新的 input/busy/onSubmit（避免闭包过期）。
   const inputRef = useRef(input);
   inputRef.current = input;
+  const cursorRef = useRef(cursor);
+  cursorRef.current = cursor;
   const busyRef = useRef(busy);
   busyRef.current = busy;
   const submitRef = useRef(onSubmit);
   submitRef.current = onSubmit;
+  const historyRef = useRef(history);
+  historyRef.current = history;
 
   // 自己接管全部 stdin 解析（不再用 ink 的 useInput）——这样鼠标上报序列绝不会
   // 被当成「打字」塞进输入框。同时开启鼠标上报、统一处理滚轮 + 键盘。
@@ -230,52 +243,118 @@ function App({ session }: { session: Session }) {
     stdout.write("\x1b[?1000h\x1b[?1006h"); // 开启鼠标上报（SGR）
     const onData = (buf: Buffer) => {
       let s = buf.toString("utf8");
+
+      // —— 鼠标滚轮 / PageUp/Down → 滚动历史区（任何时候都允许）——
       let delta = 0;
-      // 鼠标滚轮（SGR）：button 64=上滚（看历史）、65=下滚（回最新）
       s = s.replace(/\x1b\[<(\d+);\d+;\d+[Mm]/g, (_m, b: string) => {
         const n = parseInt(b, 10);
         if (n >= 64) delta += n & 1 ? -3 : 3;
         return "";
       });
-      // PageUp / PageDown 也翻历史
       s = s.replace(/\x1b\[5~/g, () => ((delta += 5), ""));
       s = s.replace(/\x1b\[6~/g, () => ((delta -= 5), ""));
       if (delta) setScroll((o) => Math.max(0, o + delta));
-      // 丢弃其它转义/CSI 序列（方向键等），剩下的才是真正的键入
-      s = s.replace(/\x1b\[[0-9;]*[A-Za-z~]/g, "").replace(/\x1b./g, "");
-      for (const ch of s) {
-        const code = ch.codePointAt(0)!;
-        if (code === 3) {
-          // Ctrl+C：等待确认 → 拒绝并中断；生成中 → 中断；空闲 → 退出
-          if (approveResolveRef.current) {
-            const r = approveResolveRef.current;
-            approveResolveRef.current = null;
-            setApproval(null);
-            r(false);
-            abortRef.current?.abort();
-          } else if (busyRef.current && abortRef.current) abortRef.current.abort();
-          else exit();
-          return;
-        }
-        // 工具确认门待回应：拦截 y/n/Enter/Esc，其它键忽略
+
+      // —— Ctrl+C ——
+      if (s.includes("\x03")) {
         if (approveResolveRef.current) {
           const r = approveResolveRef.current;
-          if (ch === "y" || ch === "Y" || ch === "\r" || ch === "\n") {
-            approveResolveRef.current = null;
-            setApproval(null);
-            r(true);
-          } else if (ch === "n" || ch === "N" || code === 27) {
-            approveResolveRef.current = null;
-            setApproval(null);
-            r(false);
+          approveResolveRef.current = null;
+          setApproval(null);
+          r(false);
+          abortRef.current?.abort();
+        } else if (busyRef.current && abortRef.current) abortRef.current.abort();
+        else exit();
+        return;
+      }
+
+      // —— 工具确认门待回应：只认 y/n/Enter/Esc，其它键忽略 ——
+      if (approveResolveRef.current) {
+        const r = approveResolveRef.current;
+        const yes = /[yY]/.test(s) || s.includes("\r") || s.includes("\n");
+        const escAlone = s.includes("\x1b") && !s.includes("\x1b[");
+        if (yes || /[nN]/.test(s) || escAlone) {
+          approveResolveRef.current = null;
+          setApproval(null);
+          r(yes);
+        }
+        return;
+      }
+
+      // —— 生成中：只允许滚动（上面已处理），其余忽略 ——
+      if (busyRef.current) return;
+
+      // —— 行编辑：用局部工作副本，避免一个 chunk 内多次 setState 读到旧值 ——
+      let inp = inputRef.current;
+      let cur = cursorRef.current;
+      let touched = false;
+      // 历史浏览：dir=-1 更早，dir=+1 更新
+      const histNav = (dir: number) => {
+        const h = historyRef.current;
+        if (h.length === 0) return;
+        if (histPosRef.current === null) {
+          if (dir > 0) return; // 没在浏览时按 ↓ 不动
+          draftRef.current = inp; // 保存草稿
+          histPosRef.current = h.length;
+        }
+        let p = histPosRef.current + dir;
+        if (p >= h.length) {
+          histPosRef.current = null; // 回到草稿
+          inp = draftRef.current;
+        } else {
+          p = Math.max(0, p);
+          histPosRef.current = p;
+          inp = h[p]!;
+        }
+        cur = inp.length;
+        touched = true;
+      };
+
+      let i = 0;
+      while (i < s.length) {
+        const rest = s.slice(i);
+        if (rest[0] === "\x1b") {
+          if (rest.startsWith("\x1b[A")) (histNav(-1), (i += 3)); // ↑
+          else if (rest.startsWith("\x1b[B")) (histNav(1), (i += 3)); // ↓
+          else if (rest.startsWith("\x1b[C")) ((cur = Math.min(inp.length, cur + 1)), (touched = true), (i += 3)); // →
+          else if (rest.startsWith("\x1b[D")) ((cur = Math.max(0, cur - 1)), (touched = true), (i += 3)); // ←
+          else if (rest.startsWith("\x1b[H")) ((cur = 0), (touched = true), (i += 3)); // Home
+          else if (rest.startsWith("\x1b[F")) ((cur = inp.length), (touched = true), (i += 3)); // End
+          else {
+            const m = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(rest);
+            if (m) i += m[0].length; // 其它 CSI：跳过
+            else {
+              inp = ""; // 单独的 ESC：清空
+              cur = 0;
+              touched = true;
+              i += 1;
+            }
           }
           continue;
         }
-        if (busyRef.current) continue; // 处理中只接受滚动 / Ctrl+C
-        if (ch === "\r" || ch === "\n") submitRef.current(inputRef.current);
-        else if (code === 127 || code === 8) setInput((v) => v.slice(0, -1));
-        else if (code === 27) setInput(""); // Esc 清空
-        else if (code >= 32) setInput((v) => v + ch); // 可见字符
+        const ch = rest[0]!;
+        const code = ch.codePointAt(0)!;
+        if (ch === "\r" || ch === "\n") {
+          submitRef.current(inp);
+          inp = "";
+          cur = 0;
+          touched = true;
+        } else if (code === 127 || code === 8) {
+          if (cur > 0) {
+            inp = inp.slice(0, cur - 1) + inp.slice(cur); // 删光标前一个字
+            cur -= 1;
+            touched = true;
+          }
+        } else if (code >= 32) {
+          inp = inp.slice(0, cur) + ch + inp.slice(cur); // 在光标处插入
+          cur += ch.length;
+          touched = true;
+        }
+        i += 1;
+      }
+      if (touched) {
+        setInput(inp);
+        setCursor(cur);
       }
     };
     process.stdin.on("data", onData);
@@ -352,11 +431,14 @@ function App({ session }: { session: Session }) {
           {/* 命令菜单（仅在输入以 / 开头时） */}
           {!busy && inCmd ? <CommandMenu input={input} /> : null}
 
-          {/* 输入框：永远是最后一行 = 终端最底部。光标块紧跟 "> " 之后 */}
+          {/* 输入框：永远在最底部；光标块画在 cursor 位置（支持 ←→ 移动） */}
           <Box>
             <Text color="cyan">💬 {"> "}</Text>
-            <Text>{input}</Text>
-            {!busy ? <Text inverse> </Text> : null}
+            <Text>{input.slice(0, cursor)}</Text>
+            {!busy ? (
+              <Text inverse>{input.slice(cursor, cursor + 1) || " "}</Text>
+            ) : null}
+            <Text>{input.slice(cursor + 1)}</Text>
             {!input && !busy ? (
               <Text dimColor>输入问题，/help 看命令，/exit 退出</Text>
             ) : null}
