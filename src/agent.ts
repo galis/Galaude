@@ -282,10 +282,9 @@ export function resumeSession(stored: StoredSession): Session {
 /** 把会话当前状态写盘（sessions/<id>.json），每轮结束自动调用。 */
 export function persist(session: Session): void {
   const firstUser = session.messages.find((m) => m.role === "user");
+  if (!firstUser) return; // 空会话（还没说过话）不必存盘
   const title =
-    firstUser && typeof firstUser.content === "string"
-      ? firstUser.content.slice(0, 50)
-      : "(空会话)";
+    typeof firstUser.content === "string" ? firstUser.content.slice(0, 50) : "(无标题)";
   saveSession({
     id: session.id,
     createdAt: session.createdAt,

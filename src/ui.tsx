@@ -3,12 +3,14 @@ import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
 import {
   runAgent,
   createSession,
+  resumeSession,
+  persist,
   SYSTEM_PROMPT,
   type Session,
   type Emitter,
   type ApprovalRequest,
 } from "./agent.js";
-import { listSessions } from "./store.js";
+import { listSessions, loadSession, type StoredSession } from "./store.js";
 import type OpenAI from "openai";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -17,7 +19,8 @@ type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/help", desc: "显示帮助" },
   { name: "/new", desc: "开一个新会话" },
-  { name: "/sessions", desc: "列出历史会话（--resume <id> 恢复）" },
+  { name: "/resume", desc: "切换到某个历史会话（可选 id，或回车选择）" },
+  { name: "/sessions", desc: "列出历史会话" },
   { name: "/history", desc: "打印当前历史的 role 时间线" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
@@ -161,6 +164,31 @@ function App({ session }: { session: Session }) {
   const approveResolveRef = useRef<((ok: boolean) => void) | null>(null);
   const histPosRef = useRef<number | null>(null); // 当前浏览到的历史下标；null=未浏览
   const draftRef = useRef(""); // 进入历史浏览前暂存的草稿
+  // 会话切换选择器：list=候选会话，index=高亮项
+  const [picker, setPicker] = useState<{
+    list: StoredSession[];
+    index: number;
+  } | null>(null);
+
+  // 切换到某个会话：先存当前，再把目标会话的历史装进来并铺到界面。
+  const switchSession = useCallback(
+    (stored: StoredSession) => {
+      persist(session); // 当前会话先保存
+      const ns = resumeSession(stored);
+      session.id = ns.id;
+      session.createdAt = ns.createdAt;
+      session.logger = ns.logger;
+      session.round = ns.round;
+      session.messages.length = 0;
+      session.messages.push(...ns.messages);
+      setPicker(null);
+      setItems([
+        { kind: "note", text: `↩️ 已切换到会话 ${ns.id}（${ns.messages.length} 条历史）` },
+        ...messagesToItems(ns.messages),
+      ]);
+    },
+    [session]
+  );
 
   // 跟随终端尺寸变化（备用屏进入/退出在 renderUI 里）。
   useEffect(() => {
@@ -199,6 +227,20 @@ function App({ session }: { session: Session }) {
         session.messages.length = 0;
         session.messages.push(...fresh.messages);
         setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
+        return;
+      }
+      if (text === "/resume" || text.startsWith("/resume ")) {
+        const arg = text.slice("/resume".length).trim();
+        if (arg) {
+          const s = loadSession(arg);
+          if (!s) return push({ kind: "note", text: `❓ 找不到会话: ${arg}` });
+          switchSession(s);
+        } else {
+          const list = listSessions();
+          if (list.length === 0)
+            return push({ kind: "note", text: "（暂无历史会话）" });
+          setPicker({ list, index: 0 }); // 打开选择器
+        }
         return;
       }
       if (text === "/sessions") {
@@ -288,6 +330,10 @@ function App({ session }: { session: Session }) {
   submitRef.current = onSubmit;
   const historyRef = useRef(history);
   historyRef.current = history;
+  const pickerRef = useRef(picker);
+  pickerRef.current = picker;
+  const switchRef = useRef(switchSession);
+  switchRef.current = switchSession;
 
   // 自己接管全部 stdin 解析（不再用 ink 的 useInput）——这样鼠标上报序列绝不会
   // 被当成「打字」塞进输入框。同时开启鼠标上报、统一处理滚轮 + 键盘。
@@ -336,6 +382,21 @@ function App({ session }: { session: Session }) {
 
       // —— 生成中：只允许滚动（上面已处理），其余忽略 ——
       if (busyRef.current) return;
+
+      // —— 会话选择器：↑↓ 选、Enter 切换、Esc 取消 ——
+      if (pickerRef.current) {
+        const pk = pickerRef.current;
+        if (s.startsWith("\x1b[A"))
+          setPicker({ list: pk.list, index: Math.max(0, pk.index - 1) });
+        else if (s.startsWith("\x1b[B"))
+          setPicker({
+            list: pk.list,
+            index: Math.min(pk.list.length - 1, pk.index + 1),
+          });
+        else if (s === "\r" || s === "\n") switchRef.current(pk.list[pk.index]!);
+        else if (s === "\x1b") setPicker(null);
+        return;
+      }
 
       // —— 行编辑：用局部工作副本，避免一个 chunk 内多次 setState 读到旧值 ——
       let inp = inputRef.current;
@@ -419,11 +480,22 @@ function App({ session }: { session: Session }) {
   }, [stdout, setRawMode, isRawModeSupported, exit]);
 
   const inCmd = input.startsWith("/");
-  const menuRows = !busy && inCmd && !approval ? COMMANDS.length + 1 : 0;
+  const menuRows =
+    !busy && inCmd && !approval && !picker ? COMMANDS.length + 1 : 0;
   // 确认框预览（命令 / diff），最多展示 14 行
   const previewLines = approval ? approval.preview.split("\n").slice(0, 14) : [];
-  // 底部区域：确认框 = 标题(1) + 预览(n) + 提示(1)；否则输入框(1) + 命令菜单
-  const bottomRows = approval ? 2 + previewLines.length : 1 + menuRows;
+  // 会话选择器：窗口化显示，保证高亮项始终可见
+  const PICK_MAX = 8;
+  const pStart = picker
+    ? Math.max(0, Math.min(picker.index - 3, picker.list.length - PICK_MAX))
+    : 0;
+  const pickerVisible = picker ? picker.list.slice(pStart, pStart + PICK_MAX) : [];
+  // 底部区域高度：确认框 / 选择器 / 输入框(+命令菜单)
+  const bottomRows = approval
+    ? 2 + previewLines.length
+    : picker
+      ? 1 + pickerVisible.length
+      : 1 + menuRows;
   const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
 
   // 把所有内容（含正在流式的答案）摊成行，再按滚动偏移取一个窗口。
@@ -480,6 +552,23 @@ function App({ session }: { session: Session }) {
             </Text>
           ))}
           <Text dimColor>y/Enter 执行 · n/Esc 拒绝 · Ctrl+C 中断</Text>
+        </Box>
+      ) : picker ? (
+        /* 会话选择器：↑↓ 选、Enter 切换、Esc 取消 */
+        <Box flexDirection="column">
+          <Text color="cyan" bold>
+            切换会话（↑↓ 选择 · Enter 切换 · Esc 取消）
+          </Text>
+          {pickerVisible.map((s, i) => {
+            const sel = pStart + i === picker.index;
+            return (
+              <Text key={s.id} inverse={sel} dimColor={!sel}>
+                {sel ? "› " : "  "}
+                {s.id}
+                {s.id === session.id ? " *当前" : ""} {s.title.slice(0, 38)}
+              </Text>
+            );
+          })}
         </Box>
       ) : (
         <>
