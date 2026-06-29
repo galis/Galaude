@@ -10,6 +10,12 @@ const envOn = (name: string, fallback: boolean): boolean => {
   return v === "1" || v.toLowerCase() === "true";
 };
 
+const envNum = (name: string, fallback: number): number => {
+  const v = process.env[name];
+  const n = v === undefined ? NaN : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+};
+
 export const config = {
   /** 模型名（env: DEEPSEEK_MODEL） */
   model: process.env.DEEPSEEK_MODEL ?? "deepseek-v4-pro",
@@ -34,4 +40,15 @@ export const config = {
    * ⚠️ 很啰嗦，只在想研究协议时开。
    */
   traceStream: envOn("TRACE_STREAM", true),
+
+  /**
+   * 上下文压缩（见 docs/context-compression.md）。阈值用「绝对 token 预算」，
+   * 测试时把 CTX_BUDGET 调小（如 2000）即可在短对话里强制触发裁剪。
+   */
+  compress: {
+    budget: envNum("CTX_BUDGET", 120000), // 上下文 token 预算 W（ctx 占比的分母）
+    trimFrac: envNum("CTX_TRIM_FRAC", 0.5), // 投影 > budget*trimFrac 时开始裁旧工具输出
+    keepRecentTools: envNum("CTX_KEEP_TOOLS", 4), // 最近几条 role:tool 输出留全
+    trimMin: envNum("CTX_TRIM_MIN", 300), // content 超过多少字符才值得裁
+  },
 };
