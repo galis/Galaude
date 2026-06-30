@@ -85,25 +85,105 @@ export function plainToLines(
   return wrapSpans([{ ...base, text }], width);
 }
 
-/** markdown → 折好行的 Line[]：标题/列表/引用/代码块 + 行内粗体/代码/斜体。 */
+// ———————————————————— 表格 ————————————————————
+
+/** 把一行表格按 | 切成单元格（去掉首尾竖线、各自 trim）。 */
+function splitRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+/** 是否是表格分隔行（每个单元格都是 :--- / --- / ---: 这种）。 */
+function isSepRow(line: string): boolean {
+  if (!line.includes("|") && !/-/.test(line)) return false;
+  const cells = splitRow(line);
+  return cells.length > 0 && cells.every((c) => /^:?-{1,}:?$/.test(c));
+}
+
+/** 把一组单元格 span 用「 │ 」连起来成一行。 */
+function joinCells(cells: Span[][]): Line {
+  const line: Span[] = [];
+  cells.forEach((spans, i) => {
+    if (i > 0) line.push({ text: " │ ", dim: true });
+    line.push(...spans);
+  });
+  return line;
+}
+
+/** 渲染对齐的表格：表头加粗、分隔线、各列按内容宽度补齐。 */
+function renderTable(header: string[], rows: string[][]): Line[] {
+  const cols = Math.max(header.length, ...rows.map((r) => r.length), 1);
+  const norm = (r: string[]) => Array.from({ length: cols }, (_, i) => r[i] ?? "");
+  const H = norm(header);
+  const R = rows.map(norm);
+  const colW = Array.from({ length: cols }, (_, i) =>
+    Math.max(dispWidth(H[i]!), ...R.map((r) => dispWidth(r[i]!)), 1)
+  );
+  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - dispWidth(s)));
+  const out: Line[] = [];
+  // 表头（加粗）
+  out.push(joinCells(H.map((c, i) => parseInline(pad(c, colW[i]!), { bold: true }))));
+  // 分隔线（与「 │ 」对齐用「─┼─」）
+  out.push([{ text: colW.map((w) => "─".repeat(w)).join("─┼─"), dim: true }]);
+  // 数据行
+  for (const r of R) out.push(joinCells(r.map((c, i) => parseInline(pad(c, colW[i]!)))));
+  return out;
+}
+
+/** markdown → 折好行的 Line[]：标题/列表/引用/代码块/表格/分隔线 + 行内粗体/代码/斜体。 */
 export function mdToLines(text: string, width: number): Line[] {
   const out: Line[] = [];
+  const lines = text.split("\n");
   let inCode = false;
-  for (const raw of text.split("\n")) {
+  let i = 0;
+  while (i < lines.length) {
+    const raw = lines[i]!;
+
     // 代码围栏 ``` 切换
     if (/^\s*```/.test(raw)) {
       inCode = !inCode;
       out.push([{ text: inCode ? "┄┄┄ code ┄┄┄" : "┄┄┄┄┄┄┄┄┄┄", dim: true }]);
+      i++;
       continue;
     }
     if (inCode) {
       out.push(...wrapSpans([{ text: raw, color: "green" }], width));
+      i++;
       continue;
     }
+
+    // 水平线 --- / *** / ___（3+ 个，整行）
+    if (/^\s*([-*_])\1{2,}\s*$/.test(raw)) {
+      out.push([{ text: "─".repeat(Math.min(width, 48)), dim: true }]);
+      i++;
+      continue;
+    }
+
+    // 表格：当前行含 | 且下一行是分隔行 → 吃掉整个表格块
+    if (raw.includes("|") && i + 1 < lines.length && isSepRow(lines[i + 1]!)) {
+      const header = splitRow(raw);
+      i += 2; // 跳过表头 + 分隔行
+      const rows: string[][] = [];
+      while (
+        i < lines.length &&
+        lines[i]!.includes("|") &&
+        lines[i]!.trim() !== "" &&
+        !isSepRow(lines[i]!)
+      ) {
+        rows.push(splitRow(lines[i]!));
+        i++;
+      }
+      out.push(...renderTable(header, rows));
+      continue;
+    }
+
     // 标题 # ~ ######
     const h = /^(#{1,6})\s+(.*)$/.exec(raw);
     if (h) {
       out.push(...wrapSpans([{ text: h[2]!, bold: true, color: "cyanBright" }], width));
+      i++;
       continue;
     }
     // 引用 >
@@ -112,12 +192,14 @@ export function mdToLines(text: string, width: number): Line[] {
       out.push(
         ...wrapSpans([{ text: "│ ", dim: true }, ...parseInline(q[1]!, { dim: true })], width)
       );
+      i++;
       continue;
     }
     // 无序列表 -, *, +
     const b = /^(\s*)[-*+]\s+(.*)$/.exec(raw);
     if (b) {
       out.push(...wrapSpans([{ text: `${b[1]}• ` }, ...parseInline(b[2]!)], width));
+      i++;
       continue;
     }
     // 有序列表 1.
@@ -126,15 +208,18 @@ export function mdToLines(text: string, width: number): Line[] {
       out.push(
         ...wrapSpans([{ text: `${n[1]}${n[2]}. `, color: "yellow" }, ...parseInline(n[3]!)], width)
       );
+      i++;
       continue;
     }
     // 空行
     if (raw.trim() === "") {
       out.push([{ text: "" }]);
+      i++;
       continue;
     }
-    // 普通行（表格 | a | b | 也走这里，等宽终端自然对齐）
+    // 普通行
     out.push(...wrapSpans(parseInline(raw), width));
+    i++;
   }
   return out;
 }
