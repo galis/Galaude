@@ -56,9 +56,7 @@ function itemLines(it: Item, width: number): Line[] {
       return ls;
     }
     case "tool_call":
-      return plainToLines(`🔧 ${it.name}(${it.argsText})`, width, {
-        color: "yellow",
-      });
+      return plainToLines(`🔧 ${it.name}`, width, { color: "yellow" }); // 只显示工具名
     case "tool_result":
       return plainToLines(" ↳ " + it.result, width, { color: "green" });
     case "note":
@@ -95,10 +93,9 @@ function messagesToItems(messages: Message[]): Item[] {
         .tool_calls;
       if (tcs)
         for (const tc of tcs)
-          out.push({ kind: "tool_call", name: tc.function.name, argsText: tc.function.arguments });
-    } else if (m.role === "tool") {
-      out.push({ kind: "tool_result", result: typeof m.content === "string" ? m.content : "" });
+          out.push({ kind: "tool_call", name: tc.function.name, argsText: "" });
     }
+    // role:"tool"（工具结果）恢复时不铺到界面——只在日志里
   }
   return out;
 }
@@ -146,6 +143,7 @@ function App({ session }: { session: Session }) {
   const [busy, setBusy] = useState(false);
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
+  const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
     cols: stdout.columns || 80,
@@ -304,9 +302,10 @@ function App({ session }: { session: Session }) {
         } else if (ev.type === "tool_call") {
           acc = "";
           setStreaming("");
-          push({ kind: "tool_call", name: ev.name, argsText: ev.argsText });
+          setActiveTools((n) => n + 1); // 起一个工具
+          push({ kind: "tool_call", name: ev.name, argsText: "" }); // 只留工具名，不显示参数
         } else if (ev.type === "tool_result") {
-          push({ kind: "tool_result", result: ev.result });
+          setActiveTools((n) => Math.max(0, n - 1)); // 完成一个；结果不显示（在日志里）
         } else if (ev.type === "usage") {
           setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
         } else if (ev.type === "note") {
@@ -339,6 +338,7 @@ function App({ session }: { session: Session }) {
         abortRef.current = null;
         setStreaming("");
         setBusy(false);
+        setActiveTools(0);
       }
     },
     [busy, exit, push, session]
@@ -538,9 +538,12 @@ function App({ session }: { session: Session }) {
   const allLines: Line[] = [
     ...items.flatMap((it) => itemLines(it, size.cols)),
     ...(streaming ? itemLines({ kind: "assistant", text: streaming }, size.cols) : []),
-    ...(busy && !streaming
-      ? [[{ text: "🤖 思考中…", color: "yellow" }] as Line]
-      : []),
+    // 实时状态：优先显示「后台运行 N 个工具」，否则在等模型时显示「思考中」
+    ...(activeTools > 0
+      ? [[{ text: `⚙ 后台运行 ${activeTools} 个工具…`, color: "yellow" }] as Line]
+      : busy && !streaming
+        ? [[{ text: "🤖 思考中…", color: "yellow" }] as Line]
+        : []),
   ];
   const maxScroll = Math.max(0, allLines.length - contentRows);
   const off = Math.min(scroll, maxScroll); // 自动跟随：内容增长时底部始终可见
