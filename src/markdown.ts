@@ -1,6 +1,7 @@
 // 极简 markdown → 终端样式渲染（够覆盖模型常回的语法）。
 // 一行 = 若干带样式的 span；交给 Ink 的 <Text bold/italic/color> 渲染。
 // 与滚动用的「行级窗口」天然兼容（仍是一行一行的）。
+import stringWidth from "string-width";
 
 export interface Span {
   text: string;
@@ -11,20 +12,16 @@ export interface Span {
 }
 export type Line = Span[];
 
-/** 估算显示宽度：CJK/全角/emoji 记 2 列，其余 1 列（用于按终端宽度折行）。 */
+/**
+ * 显示宽度——用 string-width（Ink 布局量宽的同一个库，版本一致），这样我们补的
+ * 空格和 Ink 实际渲染的列宽完全对得上，表格 │ 才能垂直对齐。
+ * ASCII 走快路径（占绝大多数、避免流式时每字符调库），非 ASCII 才交给 string-width。
+ */
 export function dispWidth(s: string): number {
   let w = 0;
   for (const ch of s) {
     const c = ch.codePointAt(0)!;
-    const wide =
-      (c >= 0x1100 && c <= 0x115f) ||
-      (c >= 0x2e80 && c <= 0xa4cf) ||
-      (c >= 0xac00 && c <= 0xd7a3) ||
-      (c >= 0xf900 && c <= 0xfaff) ||
-      (c >= 0xfe30 && c <= 0xff60) ||
-      (c >= 0xffe0 && c <= 0xffe6) ||
-      (c >= 0x1f300 && c <= 0x1faff);
-    w += wide ? 2 : 1;
+    w += c < 0x20 ? 0 : c < 0x7f ? 1 : stringWidth(ch);
   }
   return w;
 }
