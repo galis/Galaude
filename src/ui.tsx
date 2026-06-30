@@ -144,6 +144,7 @@ function App({ session }: { session: Session }) {
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
+  const [tick, setTick] = useState(0); // 驱动 spinner 动画的帧计数
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
     cols: stdout.columns || 80,
@@ -183,6 +184,13 @@ function App({ session }: { session: Session }) {
     },
     [session]
   );
+
+  // 处理中时让 spinner 转起来：busy 期间每 100ms 推进一帧，空闲就停（不空转重绘）。
+  useEffect(() => {
+    if (!busy) return;
+    const id = setInterval(() => setTick((t) => t + 1), 100);
+    return () => clearInterval(id);
+  }, [busy]);
 
   // 跟随终端尺寸变化（备用屏进入/退出在 renderUI 里）。
   useEffect(() => {
@@ -534,15 +542,19 @@ function App({ session }: { session: Session }) {
       : 1 + menuRows;
   const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
 
+  // spinner 旋转点（一圈 braille 点在转）。
+  const SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const spinner = SPINNER[tick % SPINNER.length];
+
   // 把所有内容（含正在流式的答案）摊成行，再按滚动偏移取一个窗口。
   const allLines: Line[] = [
     ...items.flatMap((it) => itemLines(it, size.cols)),
     ...(streaming ? itemLines({ kind: "assistant", text: streaming }, size.cols) : []),
-    // 实时状态：优先显示「后台运行 N 个工具」，否则在等模型时显示「思考中」
+    // 实时状态：spinner 旋转点 + 文案。优先「后台运行 N 个工具」，否则「思考中」
     ...(activeTools > 0
-      ? [[{ text: `⚙ 后台运行 ${activeTools} 个工具…`, color: "yellow" }] as Line]
+      ? [[{ text: `${spinner} 后台运行 ${activeTools} 个工具`, color: "yellow" }] as Line]
       : busy && !streaming
-        ? [[{ text: "🤖 思考中…", color: "yellow" }] as Line]
+        ? [[{ text: `${spinner} 思考中`, color: "yellow" }] as Line]
         : []),
   ];
   const maxScroll = Math.max(0, allLines.length - contentRows);
