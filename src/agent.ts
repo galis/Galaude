@@ -537,8 +537,8 @@ export async function runAgent(
   // 轮边界：上下文偏大就先把最旧的若干完整轮折叠成摘要，再开始这一轮（不折当前在飞轮）。
   await maybeCompact(session, emit);
 
-  // 最大轮数上限，防止模型陷入死循环（Phase 2 会再强化鲁棒性）。
-  const MAX_TURNS = 10;
+  // 最大轮数上限，防止模型陷入死循环（见 config.maxTurns，env: MAX_TURNS）。
+  const MAX_TURNS = config.maxTurns;
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     emit({ type: "debug", text: `──────── 第 ${turn} 轮：调用模型 ────────` });
