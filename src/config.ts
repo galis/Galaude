@@ -21,7 +21,7 @@ export const config = {
   model: process.env.DEEPSEEK_MODEL ?? "deepseek-v4-pro",
 
   /** 单次用户输入内 think→act 的最大轮数上限，防死循环（env: MAX_TURNS） */
-  maxTurns: envNum("MAX_TURNS", 10),
+  maxTurns: envNum("MAX_TURNS", 30),
 
   /** 常规调试日志：role 时间线 / token 统计 / 流式思考。env: DEBUG=0 关闭 */
   debug: process.env.DEBUG !== "0",
