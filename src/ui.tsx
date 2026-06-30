@@ -15,6 +15,7 @@ import {
 import { listSessions, loadSession, type StoredSession } from "./store.js";
 import { contextReport } from "./compress.js";
 import { config } from "./config.js";
+import { mdToLines, plainToLines, type Line } from "./markdown.js";
 import type OpenAI from "openai";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -42,62 +43,26 @@ type Item =
   | { kind: "tool_result"; result: string }
   | { kind: "note"; text: string };
 
-// 估算显示宽度：CJK/全角/emoji 记 2 列，其余 1 列（用于按终端宽度折行）。
-function dispWidth(s: string): number {
-  let w = 0;
-  for (const ch of s) {
-    const c = ch.codePointAt(0)!;
-    const wide =
-      (c >= 0x1100 && c <= 0x115f) ||
-      (c >= 0x2e80 && c <= 0xa4cf) ||
-      (c >= 0xac00 && c <= 0xd7a3) ||
-      (c >= 0xf900 && c <= 0xfaff) ||
-      (c >= 0xfe30 && c <= 0xff60) ||
-      (c >= 0xffe0 && c <= 0xffe6) ||
-      (c >= 0x1f300 && c <= 0x1faff);
-    w += wide ? 2 : 1;
-  }
-  return w;
-}
-
-// 按显示宽度把一段文字折成若干行。
-function wrap(s: string, width: number): string[] {
-  const out: string[] = [];
-  for (const raw of s.split("\n")) {
-    let cur = "";
-    let cw = 0;
-    for (const ch of raw) {
-      const w = dispWidth(ch);
-      if (cw + w > width && cur) {
-        out.push(cur);
-        cur = ch;
-        cw = w;
-      } else {
-        cur += ch;
-        cw += w;
-      }
-    }
-    out.push(cur);
-  }
-  return out;
-}
-
-// 一行渲染数据（带颜色）——把所有 Item 摊成行，便于做行级滚动窗口。
-type VLine = { text: string; color?: string; dim?: boolean };
-function itemLines(it: Item, width: number): VLine[] {
-  const mk = (s: string, color?: string, dim?: boolean): VLine[] =>
-    wrap(s, width).map((t) => ({ text: t, color, dim }));
+// 把一条 Item 摊成「带样式的行」（Line=Span[]），便于做行级滚动窗口。
+// assistant 内容走 markdown 渲染；其余纯文本套基础样式。
+function itemLines(it: Item, width: number): Line[] {
   switch (it.kind) {
     case "user":
-      return mk("💬 " + it.text, "cyan");
-    case "assistant":
-      return mk("🤖 " + it.text);
+      return plainToLines("💬 " + it.text, width, { color: "cyan" });
+    case "assistant": {
+      const ls = mdToLines(it.text, width);
+      if (ls.length === 0) ls.push([]);
+      ls[0] = [{ text: "🤖 " }, ...ls[0]!]; // 首行前面挂上机器人标记
+      return ls;
+    }
     case "tool_call":
-      return mk(`🔧 ${it.name}(${it.argsText})`, "yellow");
+      return plainToLines(`🔧 ${it.name}(${it.argsText})`, width, {
+        color: "yellow",
+      });
     case "tool_result":
-      return mk(" ↳ " + it.result, "green");
+      return plainToLines(" ↳ " + it.result, width, { color: "green" });
     case "note":
-      return mk(it.text, undefined, true);
+      return plainToLines(it.text, width, { dim: true });
   }
 }
 
@@ -570,11 +535,11 @@ function App({ session }: { session: Session }) {
   const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
 
   // 把所有内容（含正在流式的答案）摊成行，再按滚动偏移取一个窗口。
-  const allLines: VLine[] = [
+  const allLines: Line[] = [
     ...items.flatMap((it) => itemLines(it, size.cols)),
     ...(streaming ? itemLines({ kind: "assistant", text: streaming }, size.cols) : []),
     ...(busy && !streaming
-      ? [{ text: "🤖 思考中…", color: "yellow" } as VLine]
+      ? [[{ text: "🤖 思考中…", color: "yellow" }] as Line]
       : []),
   ];
   const maxScroll = Math.max(0, allLines.length - contentRows);
@@ -601,11 +566,23 @@ function App({ session }: { session: Session }) {
         ) : null}
       </Text>
 
-      {/* 内容区：行级滚动窗口，自上而下排，输入框留在最底 */}
+      {/* 内容区：行级滚动窗口，自上而下排，输入框留在最底。每行=若干带样式 span */}
       <Box flexGrow={1} flexDirection="column" overflow="hidden">
-        {view.map((l, i) => (
-          <Text key={i} color={l.color} dimColor={l.dim}>
-            {l.text || " "}
+        {view.map((line, i) => (
+          <Text key={i}>
+            {line.length === 0
+              ? " "
+              : line.map((sp, j) => (
+                  <Text
+                    key={j}
+                    bold={sp.bold}
+                    italic={sp.italic}
+                    color={sp.color}
+                    dimColor={sp.dim}
+                  >
+                    {sp.text || " "}
+                  </Text>
+                ))}
           </Text>
         ))}
       </Box>
