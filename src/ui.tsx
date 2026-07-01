@@ -13,6 +13,7 @@ import {
   type ApprovalRequest,
 } from "./agent.js";
 import { listSessions, loadSession, type StoredSession } from "./store.js";
+import { type Todo } from "./todo.js";
 import { contextReport } from "./compress.js";
 import { config } from "./config.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
@@ -28,6 +29,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/sessions", desc: "列出历史会话" },
   { name: "/history", desc: "打印当前历史的 role 时间线" },
   { name: "/context", desc: "显示当前上下文占用情况" },
+  { name: "/todo", desc: "显示当前任务清单（只读；增删让 agent 代劳）" },
   { name: "/mode", desc: "切换确认模式 auto（判风险才确认）/ strict（一律确认）" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
@@ -41,7 +43,15 @@ type Item =
   | { kind: "assistant"; text: string }
   | { kind: "tool_call"; name: string; argsText: string }
   | { kind: "tool_result"; result: string }
-  | { kind: "note"; text: string };
+  | { kind: "note"; text: string }
+  | { kind: "todos"; todos: Todo[] };
+
+// 用户侧任务状态图标（BMP 符号，避开 emoji 列宽坑；模型侧另用 [x]/[~]/[ ]）。
+const TODO_ICON: Record<Todo["status"], string> = {
+  pending: "☐",
+  in_progress: "⟳",
+  completed: "☑",
+};
 
 // 把一条 Item 摊成「带样式的行」（Line=Span[]），便于做行级滚动窗口。
 // assistant 内容走 markdown 渲染；其余纯文本套基础样式。
@@ -61,6 +71,20 @@ function itemLines(it: Item, width: number): Line[] {
       return plainToLines(" ↳ " + it.result, width, { color: "green" });
     case "note":
       return plainToLines(it.text, width, { dim: true });
+    case "todos": {
+      const done = it.todos.filter((t) => t.status === "completed").length;
+      const lines: Line[] = [
+        [{ text: `📋 计划 ${done}/${it.todos.length}`, color: "magenta" }],
+      ];
+      for (const t of it.todos)
+        lines.push([
+          {
+            text: `  ${TODO_ICON[t.status]} ${t.content}`,
+            dim: t.status === "completed",
+          },
+        ]);
+      return lines;
+    }
   }
 }
 
@@ -144,6 +168,7 @@ function App({ session }: { session: Session }) {
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
+  const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
   const [tick, setTick] = useState(0); // 驱动 spinner 动画的帧计数
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
@@ -174,7 +199,9 @@ function App({ session }: { session: Session }) {
       session.messages.length = 0;
       session.messages.push(...ns.messages);
       setPicker(null);
+      session.plan = ns.plan; // 任务计划切到目标会话
       setCtxTokens(ns.lastPromptTokens); // ctx 占比也切到目标会话
+      setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
       setItems([
@@ -231,7 +258,9 @@ function App({ session }: { session: Session }) {
         session.messages.push(...fresh.messages);
         setHistory([]); // 新会话输入历史清空
         histPosRef.current = null;
+        session.plan = fresh.plan; // 新会话空计划
         setCtxTokens(0);
+        setTodos([]);
         setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
         return;
       }
@@ -264,6 +293,9 @@ function App({ session }: { session: Session }) {
       if (text === "/clear") {
         session.messages.length = 0;
         session.messages.push({ role: "system", content: SYSTEM_PROMPT });
+        session.plan.todos = []; // 清空任务清单
+        session.plan.nextId = 1;
+        setTodos([]);
         setItems([{ kind: "note", text: "🧹 已清空上下文（新对话）" }]);
         return;
       }
@@ -276,6 +308,11 @@ function App({ session }: { session: Session }) {
       }
       if (text === "/context") {
         return push({ kind: "note", text: contextReport(session) });
+      }
+      if (text === "/todo" || text === "/todo list") {
+        return session.plan.todos.length
+          ? push({ kind: "todos", todos: session.plan.todos })
+          : push({ kind: "note", text: "（任务清单为空）" });
       }
       if (text === "/mode" || text.startsWith("/mode ")) {
         const arg = text.slice(5).trim();
@@ -318,6 +355,9 @@ function App({ session }: { session: Session }) {
           setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
         } else if (ev.type === "note") {
           push({ kind: "note", text: ev.text }); // 如「已折叠」提示
+        } else if (ev.type === "todos") {
+          setTodos(ev.todos); // 刷新标题栏常驻的 📋 done/total
+          push({ kind: "todos", todos: ev.todos }); // 详情变化时印入流
         }
       };
       // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
@@ -574,6 +614,12 @@ function App({ session }: { session: Session }) {
             {ctxTokens > config.compress.budget * config.compress.trimFrac
               ? " 🗜裁剪中"
               : ""}
+          </Text>
+        ) : null}
+        {todos.length > 0 ? (
+          <Text color="magenta">
+            {"  "}📋 {todos.filter((t) => t.status === "completed").length}/
+            {todos.length}
           </Text>
         ) : null}
         {off > 0 ? (

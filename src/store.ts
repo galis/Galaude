@@ -7,6 +7,7 @@ import {
 import { join } from "node:path";
 import type OpenAI from "openai";
 import type { SummarySegment } from "./compress.js";
+import type { TodoPlan } from "./todo.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -25,6 +26,8 @@ export interface StoredSession {
   summaries?: SummarySegment[];
   summarizedUpTo?: number;
   memory?: string[];
+  // —— 任务清单（模型驱动，恢复零重放）——
+  plan?: TodoPlan;
 }
 
 const pad = (n: number, w = 2) => String(n).padStart(w, "0");

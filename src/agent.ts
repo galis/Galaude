@@ -2,13 +2,16 @@ import type OpenAI from "openai";
 import { client, MODEL } from "./llm.js";
 import {
   toolSchemas,
-  toolRegistry,
+  pureTools,
+  statefulTools,
   needsApproval,
   describeForApproval,
+  type ToolCtx,
 } from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 import { newSessionId, saveSession, type StoredSession } from "./store.js";
+import { emptyPlan, type Todo, type TodoPlan } from "./todo.js";
 import {
   buildContext,
   shouldCompact,
@@ -38,6 +41,7 @@ export type AgentEvent =
   | { type: "tool_result"; name: string; result: string }
   | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
   | { type: "note"; text: string } // 系统提示（如「已折叠」），界面当一条 note 显示
+  | { type: "todos"; todos: Todo[] } // 任务清单变更，界面据此刷新面板
   | { type: "debug"; text: string };
 export type Emitter = (ev: AgentEvent) => void;
 
@@ -264,9 +268,11 @@ export const SYSTEM_PROMPT =
   "你是一个 AI 编程 Agent 助手，帮用户在本机完成编程相关任务。可用工具：" +
   "read_file 读文件、write_file 写/建文件、edit_file 精确改文件" +
   "（这三类文件操作一律用专门工具，不要用 run_bash 的 cat/echo/sed）；" +
-  "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算。" +
+  "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算；" +
+  "todowrite/todoread 维护多步任务清单。" +
   "优先用工具获取真实信息，不要凭空臆测或编造文件内容；" +
-  "多步任务一步步调用工具推进，完成后用简洁清晰的话回答。";
+  "遇到多步任务，先用 todowrite 列出计划，每完成一步就更新状态（同一时刻最多一个 in_progress），" +
+  "让你和用户都能追踪进度；完成后用简洁清晰的话回答。";
 
 /** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
 export interface Session {
@@ -280,6 +286,7 @@ export interface Session {
   summaries: SummarySegment[]; // 旧段摘要，append-only
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
   memory: string[]; // 外置关键事实，豁免压缩（P3 自动抽取；现可手动用）
+  plan: TodoPlan; // 任务清单（模型驱动，每轮回注上下文）
 }
 
 /** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
@@ -298,6 +305,7 @@ export function createSession(): Session {
     summaries: [],
     summarizedUpTo: 0,
     memory: [],
+    plan: emptyPlan(),
   };
 }
 
@@ -317,6 +325,7 @@ export function resumeSession(stored: StoredSession): Session {
     summaries: stored.summaries ?? [],
     summarizedUpTo: stored.summarizedUpTo ?? 0,
     memory: stored.memory ?? [],
+    plan: stored.plan ?? emptyPlan(),
   };
 }
 
@@ -336,6 +345,7 @@ export function persist(session: Session): void {
     summaries: session.summaries,
     summarizedUpTo: session.summarizedUpTo,
     memory: session.memory,
+    plan: session.plan,
   });
 }
 
@@ -666,13 +676,20 @@ export async function runAgent(
     }
 
     // 阶段 3：并行执行（只跑还没定结果的；各自 try/catch；完成即 emit，乱序但带名字）
+    // 分派：有状态工具（todo）走 statefulTools（同步、带 ctx）；其余走 pureTools（可异步）。
+    const toolCtx: ToolCtx = { plan: session.plan, emit, finishReason: finishReason ?? null };
     await Promise.all(
       toolCalls.map(async (call, i) => {
         const name = call.function.name;
         if (results[i] === null) {
-          const impl = toolRegistry[name];
           try {
-            results[i] = impl ? await impl(parsed[i]!) : `错误：未知工具 "${name}"`;
+            const stateful = statefulTools[name];
+            if (stateful) {
+              results[i] = stateful(parsed[i]!, toolCtx);
+            } else {
+              const impl = pureTools[name];
+              results[i] = impl ? await impl(parsed[i]!) : `错误：未知工具 "${name}"`;
+            }
           } catch (err) {
             results[i] = `工具执行出错：${err instanceof Error ? err.message : String(err)}`;
           }
