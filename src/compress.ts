@@ -1,5 +1,6 @@
 import type OpenAI from "openai";
 import { config } from "./config.js";
+import { renderTodos, type TodoPlan } from "./todo.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -37,6 +38,7 @@ export interface CompressState {
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖（messages[0]=system 不算）
   memory: string[];
   lastPromptTokens: number;
+  plan?: TodoPlan; // 任务清单（豁免压缩、每轮回注）
 }
 
 // ———————————————————— 层 A：裁旧工具输出 ————————————————————
@@ -93,6 +95,15 @@ function summaryMessage(summaries: SummarySegment[]): Message {
   };
 }
 
+function todoMessage(plan: TodoPlan): Message {
+  return {
+    role: "system",
+    content:
+      "【当前任务清单（你自己维护的多步进度；完成/新增用 todowrite 更新，尽量保留每项 #id）】\n" +
+      renderTodos(plan.todos),
+  };
+}
+
 /**
  * 构造这一轮发给模型的「投影」——真相源 messages 的临时视图，**绝不改 messages**。
  *
@@ -103,11 +114,12 @@ function summaryMessage(summaries: SummarySegment[]): Message {
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
  */
 export function buildContext(s: CompressState): Message[] {
-  const { messages, summaries, summarizedUpTo: k, memory, lastPromptTokens } = s;
+  const { messages, summaries, summarizedUpTo: k, memory, lastPromptTokens, plan } = s;
   const system = messages[0];
   const ctx: Message[] = system ? [system] : [];
   if (memory.length) ctx.push(memoryMessage(memory));
   if (summaries.length) ctx.push(summaryMessage(summaries));
+  if (plan && plan.todos.length) ctx.push(todoMessage(plan)); // 任务清单：记忆/摘要后·近段前，豁免压缩
 
   let recent = messages.slice(k + 1); // 近段（system 与已摘要段之后）
   if (lastPromptTokens > trimThreshold) recent = trimOldToolOutputs(recent);

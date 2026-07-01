@@ -2,6 +2,8 @@ import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import type OpenAI from "openai";
+import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
+import type { AgentEvent } from "./agent.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -113,6 +115,50 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "todoread",
+      description:
+        "读取当前任务清单及每项状态。开始多步任务前、或不确定进度时调用。无参数。",
+      parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "todowrite",
+      description:
+        "创建/更新任务清单（整表覆盖：每次传【完整】列表，不是增量）。把多步任务拆成有序清单并持续更新进度。" +
+        "规则：同一时刻最多一个 in_progress；做完一项标 completed 再把下一项标 in_progress；" +
+        "更新已有项时【保留它的 id】（清单里以 #id 显示），新增项不填 id。琐碎单步任务不必用。",
+      parameters: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            description: "完整任务列表，按执行顺序。",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "integer", description: "已有项保留其 #id；新增项省略" },
+                content: { type: "string", description: "任务描述（祈使句）" },
+                status: {
+                  type: "string",
+                  enum: ["pending", "in_progress", "completed"],
+                  description: "pending 待做 / in_progress 进行中 / completed 已完成",
+                },
+              },
+              required: ["content", "status"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["todos"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 // 需要先经用户确认才执行的「危险」工具（有副作用 / 能跑任意命令）。
@@ -123,14 +169,16 @@ export const needsApproval = new Set<string>([
   "edit_file",
 ]);
 
-// —— 2. 实现：工具名 → 本地函数 的注册表 ——
-// 每个实现接收「已解析好的参数对象」，返回一个字符串（喂回给模型当 observation）。
+// —— 2. 实现：两张分类型注册表（见设计 D3）——
+// pureTools：纯 / 外部副作用工具，签名 (args)=>string，碰不到会话（最小权限、天然并发安全）。
+// statefulTools：需读写会话状态的工具（todo），签名 (args, ctx)=>string。
+// 每个实现接收「已解析好的参数对象」，返回字符串（喂回给模型当 observation）。
 // 允许返回 Promise：像 run_bash 这种 IO 工具必须异步，否则会卡死事件循环（UI 冻结）。
 type ToolImpl = (
   args: Record<string, unknown>
 ) => string | Promise<string>;
 
-export const toolRegistry: Record<string, ToolImpl> = {
+export const pureTools: Record<string, ToolImpl> = {
   calculate({ expression }) {
     const expr = String(expression ?? "").trim();
     if (!expr) throw new Error("表达式为空");
@@ -221,6 +269,59 @@ export const toolRegistry: Record<string, ToolImpl> = {
     return `已编辑 ${p}（替换 1 处）`;
   },
 };
+
+// —— 有状态工具（todo）：拿到 ctx，可读写会话任务计划、发 UI 事件（见 D3）——
+export interface ToolCtx {
+  plan: TodoPlan; // 会话任务计划，按引用传入（只暴露这一块 → 最小权限）
+  emit: (e: AgentEvent) => void;
+  finishReason: string | null; // 本轮模型 finish_reason，用于截断自守（F1）
+}
+type StatefulToolImpl = (args: Record<string, unknown>, ctx: ToolCtx) => string;
+
+export const statefulTools: Record<string, StatefulToolImpl> = {
+  todoread(_args, ctx) {
+    return ctx.plan.todos.length
+      ? renderTodos(ctx.plan.todos)
+      : "（任务清单为空。多步任务可用 todowrite 建立计划。）";
+  },
+
+  todowrite({ todos }, ctx) {
+    // F1 截断自守：本轮输出被截断 → 已知不可信，写入前直接拒绝，旧表纹丝不动。
+    if (ctx.finishReason === "length")
+      return "⚠️ 上次输出被截断，未写入清单（避免残表覆盖）。请拆成更小的更新重试。";
+
+    const plan = ctx.plan;
+    // 校验 / 软归一 / 按 id 自愈；脏输入会 throw → 由工具循环当 observation 回喂模型自纠（F3）。
+    const r = normalizeTodos(plan.todos, todos, plan.nextId);
+    plan.todos = r.todos;
+    plan.nextId = r.nextId;
+    ctx.emit({ type: "todos", todos: r.todos });
+
+    const notes: string[] = [];
+    if (r.demoted) notes.push(`多出的 ${r.demoted} 个 in_progress 已降级 pending`);
+    if (r.healed) notes.push(`${r.healed} 项 content 漂移已按 #id 自愈`);
+    return (
+      "已更新。\n" +
+      renderTodos(r.todos) +
+      (notes.length ? "\n（注：" + notes.join("；") + "）" : "")
+    );
+  },
+};
+
+// 分派完整性（F4）：每个声明的工具须恰好落在一张表，不重不漏，否则模块加载即报错（fail fast）。
+{
+  const declared = new Set(toolSchemas.map((t) => t.function.name));
+  const pure = new Set(Object.keys(pureTools));
+  const stateful = new Set(Object.keys(statefulTools));
+  for (const name of declared) {
+    if (pure.has(name) && stateful.has(name))
+      throw new Error(`工具 ${name} 同时在 pureTools/statefulTools（歧义）`);
+    if (!pure.has(name) && !stateful.has(name))
+      throw new Error(`工具 ${name} 已声明但未在任何注册表实现`);
+  }
+  for (const name of [...pure, ...stateful])
+    if (!declared.has(name)) throw new Error(`实现了未在 toolSchemas 声明的工具 ${name}`);
+}
 
 // 极简行级 diff：剥掉公共前后缀，把变化的中段按 -旧 / +新 展示。
 function lineDiff(oldText: string, newText: string, max = 16): string {
