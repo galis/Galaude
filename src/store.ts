@@ -2,6 +2,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -45,7 +46,12 @@ const fileOf = (id: string) => join(DIR, `${id}.json`);
 
 export function saveSession(s: StoredSession): void {
   mkdirSync(DIR, { recursive: true });
-  writeFileSync(fileOf(s.id), JSON.stringify(s, null, 2));
+  const target = fileOf(s.id);
+  const tmp = `${target}.tmp`;
+  writeFileSync(tmp, JSON.stringify(s, null, 2)); // 先写临时文件
+  // 同目录 rename 原子替换：崩溃/断电时要么旧档完好、要么新档完整，杜绝半截坏 JSON。
+  // （write 与 rename 之间崩溃留下的 .tmp 无害，下次保存覆盖；不额外清理。）
+  renameSync(tmp, target);
 }
 
 /** 读取所有会话，按 updatedAt 倒序（最近的在前）。 */
