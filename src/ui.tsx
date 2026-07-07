@@ -4,15 +4,20 @@ import {
   runAgent,
   createSession,
   resumeSession,
+  adoptSession,
   persist,
   getApprovalMode,
   setApprovalMode,
-  SYSTEM_PROMPT,
   type Session,
   type Emitter,
   type ApprovalRequest,
 } from "./agent.js";
-import { listSessions, loadSession, type StoredSession } from "./store.js";
+import {
+  listSessions,
+  loadSession,
+  type StoredSession,
+  type SessionMeta,
+} from "./store.js";
 import { type Todo } from "./todo.js";
 import { contextReport } from "./compress.js";
 import { config } from "./config.js";
@@ -180,27 +185,22 @@ function App({ session }: { session: Session }) {
   const approveResolveRef = useRef<((ok: boolean) => void) | null>(null);
   const histPosRef = useRef<number | null>(null); // 当前浏览到的历史下标；null=未浏览
   const draftRef = useRef(""); // 进入历史浏览前暂存的草稿
-  // 会话切换选择器：list=候选会话，index=高亮项
+  // 会话切换选择器：list=候选会话元信息，index=高亮项（选中时才读完整文件）
   const [picker, setPicker] = useState<{
-    list: StoredSession[];
+    list: SessionMeta[];
     index: number;
   } | null>(null);
 
-  // 切换到某个会话：先存当前，再把目标会话的历史装进来并铺到界面。
+  // 切换到某个会话：先存当前，再把目标会话【全部状态】装进来并铺到界面。
+  // 整体交接必须走 adoptSession——手抄字段列表漏过压缩状态（摘要/记忆/水位线），
+  // 会让旧会话的摘要挂到新会话上、还持久化进新会话存档。
   const switchSession = useCallback(
     (stored: StoredSession) => {
       persist(session); // 当前会话先保存
       const ns = resumeSession(stored);
-      session.id = ns.id;
-      session.createdAt = ns.createdAt;
-      session.logger = ns.logger;
-      session.round = ns.round;
-      session.lastPromptTokens = ns.lastPromptTokens;
-      session.messages.length = 0;
-      session.messages.push(...ns.messages);
+      adoptSession(session, ns);
       setPicker(null);
-      session.plan = ns.plan; // 任务计划切到目标会话
-      setCtxTokens(ns.lastPromptTokens); // ctx 占比也切到目标会话
+      setCtxTokens(ns.lastPromptTokens); // ctx 占比切到目标会话
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
@@ -233,7 +233,10 @@ function App({ session }: { session: Session }) {
 
   const onSubmit = useCallback(
     async (raw: string) => {
-      if (busy) return;
+      // busy 是 state（异步刷新）：同一个 stdin chunk 里连着两个换行（粘贴多行文本）
+      // 会在它还没刷新时把 onSubmit 同步调两次，两个 runAgent 并发写同一份历史。
+      // 所以再用 busyRef 做同步守卫（进入跑 agent 分支时立刻置位）。
+      if (busy || busyRef.current) return;
       const text = raw.trim();
       setInput("");
       setCursor(0);
@@ -244,26 +247,21 @@ function App({ session }: { session: Session }) {
       // 记录到输入历史（连续重复不重复记）
       setHistory((h) => (h[h.length - 1] === text ? h : [...h, text]));
 
-      if (text === "/exit" || text === "/quit") return exit();
-      if (text === "/help") return push({ kind: "note", text: HELP });
-      if (text === "/new") {
-        // 开新会话：换 id/历史/日志（旧会话已存盘，可日后 --resume 恢复）
+      // 开新会话：换 id/历史/日志/压缩状态（旧会话已存盘，可日后 --resume 恢复）。
+      // /clear 语义相同——曾经它复用旧 id 只清 messages，下次 persist 会用
+      // 清空后的历史【覆盖旧会话存档】，且摘要/记忆/水位线全残留。
+      const startFresh = (prefix: string) => {
         const fresh = createSession();
-        session.id = fresh.id;
-        session.createdAt = fresh.createdAt;
-        session.logger = fresh.logger;
-        session.round = 0;
-        session.lastPromptTokens = 0;
-        session.messages.length = 0;
-        session.messages.push(...fresh.messages);
+        adoptSession(session, fresh);
         setHistory([]); // 新会话输入历史清空
         histPosRef.current = null;
-        session.plan = fresh.plan; // 新会话空计划
         setCtxTokens(0);
         setTodos([]);
-        setItems([{ kind: "note", text: `🆕 新会话 ${fresh.id}` }]);
-        return;
-      }
+        setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
+      };
+      if (text === "/exit" || text === "/quit") return exit();
+      if (text === "/help") return push({ kind: "note", text: HELP });
+      if (text === "/new") return startFresh("🆕 新会话");
       if (text === "/resume" || text.startsWith("/resume ")) {
         const arg = text.slice("/resume".length).trim();
         if (arg) {
@@ -290,15 +288,7 @@ function App({ session }: { session: Session }) {
           text: "历史会话（启动时 --resume <id> 恢复）：\n" + lines,
         });
       }
-      if (text === "/clear") {
-        session.messages.length = 0;
-        session.messages.push({ role: "system", content: SYSTEM_PROMPT });
-        session.plan.todos = []; // 清空任务清单
-        session.plan.nextId = 1;
-        setTodos([]);
-        setItems([{ kind: "note", text: "🧹 已清空上下文（新对话）" }]);
-        return;
-      }
+      if (text === "/clear") return startFresh("🧹 已清空上下文，新会话");
       if (text === "/history") {
         const tl = session.messages.map((m) => m.role).join(" → ");
         return push({
@@ -336,6 +326,7 @@ function App({ session }: { session: Session }) {
         return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
 
       push({ kind: "user", text });
+      busyRef.current = true; // 同步置位（见函数开头的守卫说明）
       setBusy(true);
       const ac = new AbortController(); // Ctrl+C 时 abort 它来中断本次生成
       abortRef.current = ac;
@@ -385,6 +376,7 @@ function App({ session }: { session: Session }) {
       } finally {
         abortRef.current = null;
         setStreaming("");
+        busyRef.current = false;
         setBusy(false);
         setActiveTools(0);
       }
@@ -466,8 +458,15 @@ function App({ session }: { session: Session }) {
             list: pk.list,
             index: Math.min(pk.list.length - 1, pk.index + 1),
           });
-        else if (s === "\r" || s === "\n") switchRef.current(pk.list[pk.index]!);
-        else if (s === "\x1b") setPicker(null);
+        else if (s === "\r" || s === "\n") {
+          // 列表里只有元信息，选中这一刻才读完整会话文件
+          const full = loadSession(pk.list[pk.index]!.id);
+          if (full) switchRef.current(full);
+          else {
+            setPicker(null);
+            push({ kind: "note", text: `❓ 会话文件读不出来: ${pk.list[pk.index]!.id}` });
+          }
+        } else if (s === "\x1b") setPicker(null);
         return;
       }
 
