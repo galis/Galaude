@@ -1,10 +1,13 @@
 // 依赖 config 默认值：keepRecentTurns=3、foldGroupSize=4（跑测试时别设 CTX_* 环境变量）。
 import { describe, it, expect } from "vitest";
 import type OpenAI from "openai";
+import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import {
   headTail,
   buildContext,
+  buildContextWith,
   pickCompactionRange,
+  pickCompactionRangeWith,
   applyCompaction,
   pickFoldGroup,
   applyFold,
@@ -12,6 +15,7 @@ import {
   type CompressState,
   type SummarySegment,
 } from "./compress.js";
+import { lcOps } from "./lgraph/messages.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -118,6 +122,45 @@ describe("applyCompaction / buildContext", () => {
     const ctx = buildContext(s);
     expect(String(ctx[1]!.content)).toContain("用户偏好中文回答");
     expect(String(ctx[2]!.content)).toContain("s1-2");
+  });
+});
+
+describe("LC 方言（LangGraph 引擎走同一套压缩逻辑）", () => {
+  // 与上面 OpenAI 方言的场景同构：同一套断言，换一种消息表示。
+  const lcMessages = () => [
+    new SystemMessage("system prompt"),
+    new HumanMessage("u1"), new AIMessage("a1"),
+    new HumanMessage("u2"), new AIMessage("a2"),
+    new HumanMessage("u3"), new AIMessage("a3"),
+    new HumanMessage("u4"), new AIMessage("a4"),
+  ];
+
+  it("pickCompactionRangeWith：折掉最近窗口之前的完整轮", () => {
+    const s = {
+      messages: lcMessages(),
+      summaries: [],
+      summarizedUpTo: 0,
+      memory: [],
+      lastPromptTokens: 0,
+    };
+    expect(pickCompactionRangeWith(lcOps, s)).toEqual([1, 2]);
+  });
+
+  it("buildContextWith：system 缓存根 + 摘要块 + 近段，真相源不动", () => {
+    const s = {
+      messages: lcMessages(),
+      summaries: [{ range: [1, 2] as [number, number], level: 1, text: "第一轮摘要" }],
+      summarizedUpTo: 2,
+      memory: ["用户偏好中文回答"],
+      lastPromptTokens: 0,
+    };
+    const ctx = buildContextWith(lcOps, s);
+    expect(s.messages).toHaveLength(9);
+    expect(ctx[0]).toBe(s.messages[0]);
+    expect(String(ctx[1]!.content)).toContain("用户偏好中文回答"); // 记忆在摘要前
+    expect(String(ctx[2]!.content)).toContain("第一轮摘要");
+    expect(ctx).toHaveLength(1 + 2 + 6); // system + 记忆/摘要 + 近段 [3..8]
+    expect(String(ctx[3]!.content)).toBe("u2"); // 近段从轮边界(user)开始
   });
 });
 
