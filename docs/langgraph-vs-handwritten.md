@@ -3,8 +3,8 @@
 同一个终端 UI、同一份会话存档、同一套工具注册表，底下两个引擎可一键切换：
 
 ```bash
-npm run dev                       # 手写引擎（默认）
-ENGINE=langgraph npm run dev      # LangGraph 引擎
+npm run dev                       # LangGraph 引擎（默认）
+ENGINE=handwritten npm run dev    # 手写引擎（对照基线）
 ```
 
 切换的支点是 `src/engine.ts`：`ui.tsx`/`index.ts` 只认 `runAgent(session, input, emit, signal, approve)`

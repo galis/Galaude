@@ -2,9 +2,9 @@
 
 不用任何框架，用 TypeScript 实现 `think → act → observe` 循环，吃透 function calling 和 agent 编排的底层原理。模型用 DeepSeek（OpenAI 兼容协议）。
 
-Phase 3 加入了 **LangGraph 对照引擎**：同一个 UI、同一份会话存档，`ENGINE=langgraph`
-一键切换到用 StateGraph 实现的同构循环，与手写逻辑逐项对比（见
-`docs/langgraph-vs-handwritten.md`）。同一个会话可以两个引擎交替接续。
+Phase 3 加入了 **LangGraph 引擎**（现为默认）：同一个 UI、同一份会话存档，
+`ENGINE=handwritten` 一键切回手写循环做对照（见 `docs/langgraph-vs-handwritten.md`）。
+同一个会话可以两个引擎交替接续。
 
 ## 快速开始
 
@@ -17,7 +17,7 @@ npm run dev -- "帮我算 (3+4)*5"   # 一次性模式：跑一句就退出
 npm run dev -- --continue   # 接续最近一次会话
 npm run dev -- --resume <id># 接续指定会话（id 可只给前缀）
 
-ENGINE=langgraph npm run dev      # 换 LangGraph 引擎跑（其余用法完全一样）
+ENGINE=handwritten npm run dev    # 切回手写引擎跑（其余用法完全一样；默认 langgraph）
 ```
 
 会话会自动存盘到 `sessions/<id>.json`（元信息进 `sessions/index.json` 轻量索引），
@@ -107,7 +107,7 @@ npm run build      # 编译到 dist/（tsconfig.build.json，不含测试）
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | （必填） | API key |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
-| `ENGINE` | `handwritten` | `langgraph` 切换到 LangGraph 对照引擎 |
+| `ENGINE` | `langgraph` | `handwritten` 切回手写引擎（对照基线） |
 | `LANGSMITH_TRACING` | 关 | `true` 开启 LangSmith 全链路追踪（仅 langgraph 引擎；注意 prompt 会上传云端） |
 | `LANGSMITH_API_KEY` | — | LangSmith key（配合上一项） |
 | `MAX_TURNS` | 30 | 单次输入内 think→act 最大轮数 |

@@ -22,12 +22,12 @@ export const config = {
 
   /**
    * 引擎选择（env: ENGINE）。两个引擎共用同一个 UI / 会话存档 / 工具注册表：
-   *   handwritten（默认）：src/agent.ts 手写 think→act→observe 循环
-   *   langgraph：src/lgraph/ 用 LangGraph StateGraph 实现的同构循环（Phase 3 对照）
+   *   langgraph（默认）：src/lgraph/ 用 LangGraph StateGraph 实现的循环（Phase 3）
+   *   handwritten：src/agent.ts 手写 think→act→observe 循环（对照基线）
    */
-  engine: (["langgraph", "lg"].includes(process.env.ENGINE ?? "")
-    ? "langgraph"
-    : "handwritten") as "handwritten" | "langgraph",
+  engine: (["handwritten", "hand", "hw"].includes(process.env.ENGINE ?? "")
+    ? "handwritten"
+    : "langgraph") as "handwritten" | "langgraph",
 
   /** 单次用户输入内 think→act 的最大轮数上限，防死循环（env: MAX_TURNS） */
   maxTurns: envNum("MAX_TURNS", 30),
