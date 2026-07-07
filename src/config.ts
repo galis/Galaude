@@ -23,14 +23,20 @@ export const config = {
   /** 单次用户输入内 think→act 的最大轮数上限，防死循环（env: MAX_TURNS） */
   maxTurns: envNum("MAX_TURNS", 30),
 
+  /** run_bash 单条命令超时毫秒数（env: BASH_TIMEOUT_MS）。构建/测试类命令常超 15s，默认给 60s。 */
+  bashTimeoutMs: envNum("BASH_TIMEOUT_MS", 60_000),
+
   /** 常规调试日志：role 时间线 / token 统计 / 流式思考。env: DEBUG=0 关闭 */
   debug: process.env.DEBUG !== "0",
 
   /**
-   * 流式逐片追踪开关（env: TRACE_STREAM=1）。
+   * 重型协议研究日志开关（env: TRACE_STREAM=1）。
    *
-   * 关（默认 false）：日志只记每轮「累积后」的思考/正文/拼好的 tool_calls。
-   * 开（true）：把流式回来的【每一个 delta chunk 的原始 JSON】全部记进日志，
+   * 关（默认 false）：日志只记每轮「累积后」的思考/正文/拼好的 tool_calls，
+   *            以及投影的 role 时间线（不含全文，日志体积可控）。
+   * 开（true）：额外记两样很大的东西——
+   *            a) 每轮发给模型的完整投影 messages JSON（每轮重复全部历史，O(n²) 膨胀）；
+   *            b) 流式回来的【每一个 delta chunk 的原始 JSON】，
    *            用来研究 SSE 流式协议——能看到：
    *              · 第一片通常只带 delta.role="assistant"
    *              · 正文分多片，每片 delta.content 是一小段文字
@@ -42,14 +48,17 @@ export const config = {
    *
    * ⚠️ 很啰嗦，只在想研究协议时开。
    */
-  traceStream: envOn("TRACE_STREAM", true),
+  traceStream: envOn("TRACE_STREAM", false),
 
   /**
    * 上下文压缩（见 docs/context-compression.md）。阈值用「绝对 token 预算」，
    * 测试时把 CTX_BUDGET 调小（如 2000）即可在短对话里强制触发裁剪。
+   *
+   * ⚠️ budget 必须 ≤ 模型真实上下文窗口，否则压缩永远来不及触发、API 先溢出报错。
+   * 默认 1M 对应 deepseek-v4-pro 的 1M 窗口；换更小窗口的模型时记得用 CTX_BUDGET 调小。
    */
   compress: {
-    budget: envNum("CTX_BUDGET", 1*1024*1024),  // 1M 上下文 token 预算 W（ctx 占比的分母）
+    budget: envNum("CTX_BUDGET", 1*1024*1024),  // 上下文 token 预算 W（ctx 占比的分母）＝模型窗口
     trimFrac: envNum("CTX_TRIM_FRAC", 0.5), // 投影 > budget*trimFrac 时开始裁旧工具输出（层 A）
     summarizeFrac: envNum("CTX_SUM_FRAC", 0.7), // 投影 > budget*summarizeFrac 时折叠旧轮成摘要（层 B）
     keepRecentTools: envNum("CTX_KEEP_TOOLS", 4), // 最近几条 role:tool 输出留全

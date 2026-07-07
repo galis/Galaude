@@ -1,7 +1,9 @@
 import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import type OpenAI from "openai";
+import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import type { AgentEvent } from "./agent.js";
 
@@ -169,6 +171,45 @@ export const needsApproval = new Set<string>([
   "edit_file",
 ]);
 
+// —— 确定性风险规则（auto 模式的第一道闸）——
+// LLM 判风险可能被工具输出里的提示注入带偏；这些模式命中就直接要求确认，
+// 不再问模型。误报的代价只是多弹一次确认框，可以接受。
+const BASH_RISK_RULES: [RegExp, string][] = [
+  [/\brm\b/, "删除文件（rm）"],
+  [/\bsudo\b/, "提权（sudo）"],
+  [/(^|\s)\d?>{1,2}\s*[^&\s]/, "输出重定向写文件（>/>>）"],
+  [/\|\s*(ba|z|da)?sh\b/, "管道进 shell 执行（curl|sh 类）"],
+  [/\b(curl|wget)\b/, "外联下载"],
+  [/\bdd\b/, "dd 底层写盘"],
+  [/\bmkfs/, "格式化文件系统"],
+  [/\bgit\s+push\b.*(\s-f\b|--force)/, "git 强制推送"],
+  [/\bgit\s+reset\b.*--hard/, "git reset --hard 丢弃改动"],
+  [/\b(chmod|chown)\b\s+-\w*R/, "递归改权限/属主"],
+];
+
+/**
+ * 规则判风险：命中返回一句理由，未命中返回 null（交给 LLM 二次把关）。
+ * write_file/edit_file 写到 cwd 之外也算风险（agent 本该只动当前项目）。
+ */
+export function ruleRisk(
+  name: string,
+  args: Record<string, unknown>
+): string | null {
+  if (name === "run_bash") {
+    const cmd = String(args.command ?? "");
+    for (const [re, why] of BASH_RISK_RULES) if (re.test(cmd)) return why;
+    return null;
+  }
+  if (name === "write_file" || name === "edit_file") {
+    const p = resolve(String(args.path ?? ""));
+    const cwd = process.cwd();
+    if (p !== cwd && !p.startsWith(cwd + sep))
+      return `写工作目录（${cwd}）之外的路径`;
+    return null;
+  }
+  return null;
+}
+
 // —— 2. 实现：两张分类型注册表（见设计 D3）——
 // pureTools：纯 / 外部副作用工具，签名 (args)=>string，碰不到会话（最小权限、天然并发安全）。
 // statefulTools：需读写会话状态的工具（todo），签名 (args, ctx)=>string。
@@ -209,13 +250,13 @@ export const pureTools: Record<string, ToolImpl> = {
     const cmd = String(command ?? "").trim();
     if (!cmd) throw new Error("command 为空");
 
-    // 异步执行（不阻塞事件循环 → UI 不冻结）；限时 15s、限输出 1MB。
+    // 异步执行（不阻塞事件循环 → UI 不冻结）；超时见 config.bashTimeoutMs、限输出 1MB。
     const clip = (s: string) =>
       s.length > 4000 ? s.slice(0, 4000) + "\n…(输出已截断)" : s;
     try {
       const { stdout, stderr } = await execFileAsync("bash", ["-c", cmd], {
         encoding: "utf8",
-        timeout: 15_000,
+        timeout: config.bashTimeoutMs,
         maxBuffer: 1024 * 1024,
       });
       return `exit=0\n${clip(`${stdout}${stderr}`) || "(无输出)"}`;
@@ -324,7 +365,7 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
 }
 
 // 极简行级 diff：剥掉公共前后缀，把变化的中段按 -旧 / +新 展示。
-function lineDiff(oldText: string, newText: string, max = 16): string {
+export function lineDiff(oldText: string, newText: string, max = 16): string {
   const a = oldText.split("\n");
   const b = newText.split("\n");
   let p = 0;
