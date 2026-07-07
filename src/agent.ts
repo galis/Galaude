@@ -11,6 +11,13 @@ import {
 } from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
 import { config } from "./config.js";
+import {
+  RISK_JUDGE_SYSTEM,
+  SUMMARIZE_SYSTEM,
+  FOLD_SYSTEM,
+  parseRisk,
+  parseSummary,
+} from "./llmtasks.js";
 import { newSessionId, saveSession, type StoredSession } from "./store.js";
 import { emptyPlan, type Todo, type TodoPlan } from "./todo.js";
 import {
@@ -407,32 +414,11 @@ async function summarizeChunk(
   const res = await client.chat.completions.create({
     model: MODEL,
     messages: [
-      {
-        role: "system",
-        content:
-          "你是对话摘要器。只输出一个 JSON 对象，形如 " +
-          '{"summary": "...", "facts": ["..."]}。' +
-          "summary：把这段对话浓缩成简洁中文要点，保留用户目标/决定、文件路径与改动、" +
-          "命令与结果、关键事实与报错。facts：需长期记住的稳定事实（用户偏好/项目约定/" +
-          "关键决定/身份信息等），没有就空数组。不要编造，不要客套。",
-      },
+      { role: "system", content: SUMMARIZE_SYSTEM }, // 提示词与解析在 llmtasks.ts，两引擎共用
       { role: "user", content: "对话片段：\n\n" + renderTranscript(slice) },
     ],
   }, { signal }); // 接中断信号：Ctrl+C 时内部 LLM 调用也随之取消
-  const raw = res.choices[0]?.message?.content?.trim() ?? "";
-  try {
-    const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
-      summary?: unknown;
-      facts?: unknown;
-    };
-    const summary = String(o.summary ?? "").trim() || "(摘要为空)";
-    const facts = Array.isArray(o.facts)
-      ? o.facts.map((f) => String(f).trim()).filter(Boolean)
-      : [];
-    return { summary, facts };
-  } catch {
-    return { summary: raw || "(摘要为空)", facts: [] }; // 不是 JSON 就当纯摘要
-  }
+  return parseSummary(res.choices[0]?.message?.content ?? "");
 }
 
 /**
@@ -448,27 +434,11 @@ async function judgeRisk(
     const res = await client.chat.completions.create({
       model: MODEL,
       messages: [
-        {
-          role: "system",
-          content:
-            "你是工具调用风险判官。判断给定工具调用是否「有风险」。" +
-            "有风险=破坏性/不可逆（rm、删除、覆盖重要文件、git reset --hard / git push、drop、清空目录）、" +
-            "提权或改系统（sudo、改系统配置或环境变量）、对外发数据/下载执行（curl|sh、上传、外联）、大范围批量改动。" +
-            "低风险=只读或查询（ls、cat、grep、git status/diff、find）、构建测试、常规单文件编辑、echo、mkdir。" +
-            '只输出 JSON：{"risky": true 或 false, "reason": "一句话中文理由"}。',
-        },
+        { role: "system", content: RISK_JUDGE_SYSTEM }, // 提示词与解析在 llmtasks.ts，两引擎共用
         { role: "user", content: `工具: ${name}\n参数: ${JSON.stringify(args)}` },
       ],
     }, { signal });
-    const raw = res.choices[0]?.message?.content?.trim() ?? "";
-    const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
-      risky?: unknown;
-      reason?: unknown;
-    };
-    return {
-      risky: Boolean(o.risky),
-      reason: String(o.reason ?? "").trim() || "(无说明)",
-    };
+    return parseRisk(res.choices[0]?.message?.content ?? "");
   } catch {
     return { risky: true, reason: "风险判定失败，保守起见需确认" };
   }
@@ -479,12 +449,7 @@ async function summarizeTexts(texts: string[], signal?: AbortSignal): Promise<st
   const res = await client.chat.completions.create({
     model: MODEL,
     messages: [
-      {
-        role: "system",
-        content:
-          "把下面多段对话摘要进一步合并、浓缩成一段更短的要点，保留最重要的目标/决定/" +
-          "文件/结论，丢弃细枝末节。只输出合并后的摘要正文。",
-      },
+      { role: "system", content: FOLD_SYSTEM }, // 提示词在 llmtasks.ts，两引擎共用
       {
         role: "user",
         content: texts.map((t, i) => `[摘要${i + 1}]\n${t}`).join("\n\n"),
