@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
 import {
-  runAgent,
   createSession,
   resumeSession,
   adoptSession,
@@ -12,6 +11,7 @@ import {
   type Emitter,
   type ApprovalRequest,
 } from "./agent.js";
+import { runAgent } from "./engine.js"; // 引擎接缝：ENGINE=langgraph 可切换实现
 import {
   listSessions,
   loadSession,
@@ -159,7 +159,10 @@ function App({ session }: { session: Session }) {
   const { stdout } = useStdout();
   const { setRawMode, isRawModeSupported } = useStdin();
   const [items, setItems] = useState<Item[]>(() => [
-    { kind: "note", text: `📝 会话 ${session.id} · 日志 ${session.logger.path}` },
+    {
+      kind: "note",
+      text: `📝 会话 ${session.id} · 引擎 ${config.engine} · 日志 ${session.logger.path}`,
+    },
     ...messagesToItems(session.messages), // 恢复会话时把历史铺上来
   ]);
   const [input, setInput] = useState("");
