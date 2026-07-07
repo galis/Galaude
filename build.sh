@@ -12,7 +12,7 @@ npm run typecheck
 
 echo "[build] 3/3 编译到 dist/ …"
 rm -rf dist
-# tsconfig 里是 noEmit=true（给 typecheck 用），这里用命令行覆盖，真正产出 JS。
-npx tsc -p tsconfig.json --noEmit false --outDir dist
+# 出 JS 走 tsconfig.build.json（noEmit=false、outDir=dist、排除测试文件）。
+npm run build
 
 echo "[build] 完成 ✅  运行: node dist/index.js \"你的问题\""
