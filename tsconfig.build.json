@@ -1,0 +1,10 @@
+{
+  // 编译产物配置：typecheck 用根 tsconfig（noEmit），真正出 JS 走这份。
+  // build.sh / `npm run build` 都用它，不再用命令行 --noEmit false 覆盖。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist"
+  },
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"]
+}
