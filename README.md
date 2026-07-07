@@ -2,6 +2,10 @@
 
 不用任何框架，用 TypeScript 实现 `think → act → observe` 循环，吃透 function calling 和 agent 编排的底层原理。模型用 DeepSeek（OpenAI 兼容协议）。
 
+Phase 3 加入了 **LangGraph 对照引擎**：同一个 UI、同一份会话存档，`ENGINE=langgraph`
+一键切换到用 StateGraph 实现的同构循环，与手写逻辑逐项对比（见
+`docs/langgraph-vs-handwritten.md`）。同一个会话可以两个引擎交替接续。
+
 ## 快速开始
 
 ```bash
@@ -12,6 +16,8 @@ npm run dev                 # 进入多轮对话（Ink 终端 UI，输入框固�
 npm run dev -- "帮我算 (3+4)*5"   # 一次性模式：跑一句就退出
 npm run dev -- --continue   # 接续最近一次会话
 npm run dev -- --resume <id># 接续指定会话（id 可只给前缀）
+
+ENGINE=langgraph npm run dev      # 换 LangGraph 引擎跑（其余用法完全一样）
 ```
 
 会话会自动存盘到 `sessions/<id>.json`（元信息进 `sessions/index.json` 轻量索引），
@@ -51,18 +57,24 @@ npm run dev -- --resume <id># 接续指定会话（id 可只给前缀）
 
 ```
 src/
-  config.ts     # 集中配置（model / maxTurns / bash 超时 / 压缩阈值…），文件默认值 ← env 覆盖
+  config.ts     # 集中配置（engine / model / maxTurns / bash 超时 / 压缩阈值…），文件默认值 ← env 覆盖
   llm.ts        # DeepSeek 客户端（openai SDK + baseURL）、模型名
   tools.ts      # 工具的「声明」(JSON schema) + 「实现」(本地函数注册表) + 风险规则
   logger.ts     # 会话日志（每次运行一个 logs/run-*.log，last.log 软链最新）
   store.ts      # 会话持久化（sessions/<id>.json + index.json 轻量索引）
   todo.ts       # 任务清单领域逻辑（纯函数：渲染 / 校验 / 按 id 自愈）
-  compress.ts   # 上下文压缩（投影 / 裁旧工具输出 / 分段摘要 / 分级折叠）
-  agent.ts      # 核心 think→act→observe 循环 + 流式 + 会话(Session) + 持久化；对外发「事件」
+  compress.ts   # 上下文压缩（投影 / 裁旧工具输出 / 分段摘要 / 分级折叠；消息方言可插拔）
+  llmtasks.ts   # 判风险/摘要的「提示词 + 防御式解析」（两个引擎共用，保证行为一致）
+  agent.ts      # 手写引擎：think→act→observe 循环 + 流式 + 会话(Session)；对外发「事件」
+  engine.ts     # 引擎接缝：按 config.engine 分派到手写 / LangGraph 实现
+  lgraph/       # LangGraph 对照引擎（Phase 3）
+    graph.ts    #   状态通道 + 5 节点（compact/agent/judge/approve/tools）+ 接线
+    engine.ts   #   runAgentLG 适配器：播种/修补线程、interrupt↔确认门、镜像回写
+    messages.ts #   消息方言桥：OpenAI wire 格式 ↔ LC BaseMessage、悬挂修补
   markdown.ts   # 终端 markdown 渲染（粗体/代码/表格对齐/列表…，CJK 宽度友好）
   ui.tsx        # Ink 交互界面（固定底部输入框 + 上方滚动 + 斜杠菜单 + 确认门）
   index.ts      # 入口：会话恢复(--continue/--resume) / TTY→Ink UI / 一次性 / 管道回退
-  *.test.ts     # vitest 单测（todo 归一化 / 压缩选段 / markdown / diff / 风险规则）
+  *.test.ts     # vitest 单测（todo / 压缩双方言 / markdown / 风险规则 / 消息桥 / 解析器）
 ```
 
 > agent.ts 不直接写屏，而是把「要显示的东西」抛成事件（`AgentEvent`），
@@ -95,6 +107,9 @@ npm run build      # 编译到 dist/（tsconfig.build.json，不含测试）
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | （必填） | API key |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
+| `ENGINE` | `handwritten` | `langgraph` 切换到 LangGraph 对照引擎 |
+| `LANGSMITH_TRACING` | 关 | `true` 开启 LangSmith 全链路追踪（仅 langgraph 引擎；注意 prompt 会上传云端） |
+| `LANGSMITH_API_KEY` | — | LangSmith key（配合上一项） |
 | `MAX_TURNS` | 30 | 单次输入内 think→act 最大轮数 |
 | `BASH_TIMEOUT_MS` | 60000 | run_bash 单条命令超时 |
 | `APPROVAL_MODE` | `auto` | 确认门模式（auto/strict，运行中 /mode 切） |
@@ -113,4 +128,8 @@ npm run build      # 编译到 dist/（tsconfig.build.json，不含测试）
 - **Phase 2（已完成）**：多工具自动选择、工具报错当 observation 回喂、最大轮数上限、
   流式输出、并行工具调用、确认门（规则 + 模型双层判风险）、会话持久化/恢复、
   上下文压缩（裁剪/摘要/分级折叠/外置记忆）、任务清单、终端 markdown 渲染、单测。
-- **Phase 3**：迁移到 LangGraph，对照手写逻辑；接 LangSmith 做可观测性。
+- **Phase 3（已完成）**：LangGraph 对照引擎（`ENGINE=langgraph`，同 UI/同存档双引擎并存、
+  interrupt 确认门、投影压缩复用），LangSmith 可观测性（env 两行开启）。
+  设计取舍与逐块对照见 `docs/langgraph-vs-handwritten.md`。
+- **下一步（可选）**：time travel（按 checkpoint 分叉重跑）、`createAgent` + middleware
+  第三遍对照实现。
