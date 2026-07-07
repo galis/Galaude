@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderTodos, type TodoPlan } from "./todo.js";
 
-type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
 const {
   budget,
@@ -24,6 +24,44 @@ export const ctxBudget = budget;
 /** 超过这个 token 数就开始裁旧工具输出（层 A）。 */
 export const trimThreshold = budget * trimFrac;
 
+// ———————————————————— 消息方言适配 ————————————————————
+// 压缩逻辑本身与「消息长什么样」无关：手写引擎用 OpenAI wire 格式，
+// LangGraph 引擎用 LangChain 的 BaseMessage。这里只依赖 4 个操作，
+// 两个引擎各自提供实现（LC 版见 src/lgraph/messages.ts）。
+
+export type MsgRole = "system" | "user" | "assistant" | "tool" | "other";
+
+export interface MessageOps<M> {
+  role(m: M): MsgRole;
+  /** 纯文本 content；不是字符串（多模态等）返回 null，压缩就不碰它。 */
+  text(m: M): string | null;
+  /** 克隆一条消息并替换其文本 content（裁剪工具输出用，其余字段保留）。 */
+  withText(m: M, text: string): M;
+  /** 构造一条 system 消息（记忆/摘要/任务清单块）。 */
+  system(text: string): M;
+}
+
+/** OpenAI wire 格式的方言实现（手写引擎；也是存盘格式）。 */
+export const oaiOps: MessageOps<OAIMessage> = {
+  role(m) {
+    return m.role === "system" ||
+      m.role === "user" ||
+      m.role === "assistant" ||
+      m.role === "tool"
+      ? m.role
+      : "other";
+  },
+  text(m) {
+    return typeof m.content === "string" ? m.content : null;
+  },
+  withText(m, text) {
+    return { ...m, content: text };
+  },
+  system(text) {
+    return { role: "system", content: text };
+  },
+};
+
 /** 一段摘要：覆盖 messages[range[0]..range[1]]，append-only。 */
 export interface SummarySegment {
   range: [number, number];
@@ -32,8 +70,8 @@ export interface SummarySegment {
 }
 
 /** buildContext / 折叠所需的会话状态（Session 在结构上满足它）。 */
-export interface CompressState {
-  messages: Message[];
+export interface CompressState<M = OAIMessage> {
+  messages: M[];
   summaries: SummarySegment[];
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖（messages[0]=system 不算）
   memory: string[];
@@ -63,46 +101,29 @@ export function headTail(content: string, head = 4, tail = 4): string {
  * 保留最近 keepRecentTools 条 role:"tool" 原文，更早且较大的换成占位。
  * 只改 content、绝不删消息 → 天然不破坏 tool_call/tool 配对。
  */
-function trimOldToolOutputs(messages: Message[]): Message[] {
-  const toolIdx = messages.flatMap((m, i) => (m.role === "tool" ? [i] : []));
+function trimOldToolOutputs<M>(ops: MessageOps<M>, messages: M[]): M[] {
+  const toolIdx = messages.flatMap((m, i) => (ops.role(m) === "tool" ? [i] : []));
   const keepFrom = Math.max(0, toolIdx.length - keepRecentTools);
   const keep = new Set(toolIdx.slice(keepFrom));
-  return messages.map((m, i) =>
-    m.role === "tool" &&
-    !keep.has(i) &&
-    typeof m.content === "string" &&
-    m.content.length > trimMin
-      ? { ...m, content: headTail(m.content) }
-      : m
-  );
+  return messages.map((m, i) => {
+    if (ops.role(m) !== "tool" || keep.has(i)) return m;
+    const text = ops.text(m);
+    return text !== null && text.length > trimMin ? ops.withText(m, headTail(text)) : m;
+  });
 }
 
 // ———————————————————— 层 B/C：摘要 + 外置记忆 ————————————————————
 
-function memoryMessage(memory: string[]): Message {
-  return {
-    role: "system",
-    content: "【已知事实（请始终遵守）】\n" + memory.map((s) => "- " + s).join("\n"),
-  };
-}
+const memoryText = (memory: string[]) =>
+  "【已知事实（请始终遵守）】\n" + memory.map((s) => "- " + s).join("\n");
 
-function summaryMessage(summaries: SummarySegment[]): Message {
-  return {
-    role: "system",
-    content:
-      "【早前对话摘要（更久远的历史已折叠成下面要点）】\n" +
-      summaries.map((s) => s.text).join("\n\n"),
-  };
-}
+const summaryText = (summaries: SummarySegment[]) =>
+  "【早前对话摘要（更久远的历史已折叠成下面要点）】\n" +
+  summaries.map((s) => s.text).join("\n\n");
 
-function todoMessage(plan: TodoPlan): Message {
-  return {
-    role: "system",
-    content:
-      "【当前任务清单（你自己维护的多步进度；完成/新增用 todowrite 更新，尽量保留每项 #id）】\n" +
-      renderTodos(plan.todos),
-  };
-}
+const todoText = (plan: TodoPlan) =>
+  "【当前任务清单（你自己维护的多步进度；完成/新增用 todowrite 更新，尽量保留每项 #id）】\n" +
+  renderTodos(plan.todos);
 
 /**
  * 构造这一轮发给模型的「投影」——真相源 messages 的临时视图，**绝不改 messages**。
@@ -113,24 +134,28 @@ function todoMessage(plan: TodoPlan): Message {
  * - 近段起点 messages[k+1] 落在轮边界（user 消息），所以「全 system 在前、user 在后」序列合法。
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
  */
-export function buildContext(s: CompressState): Message[] {
+export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[] {
   const { messages, summaries, summarizedUpTo: k, memory, lastPromptTokens, plan } = s;
   const system = messages[0];
-  const ctx: Message[] = system ? [system] : [];
-  if (memory.length) ctx.push(memoryMessage(memory));
-  if (summaries.length) ctx.push(summaryMessage(summaries));
-  if (plan && plan.todos.length) ctx.push(todoMessage(plan)); // 任务清单：记忆/摘要后·近段前，豁免压缩
+  const ctx: M[] = system ? [system] : [];
+  if (memory.length) ctx.push(ops.system(memoryText(memory)));
+  if (summaries.length) ctx.push(ops.system(summaryText(summaries)));
+  if (plan && plan.todos.length) ctx.push(ops.system(todoText(plan))); // 任务清单：记忆/摘要后·近段前，豁免压缩
 
   let recent = messages.slice(k + 1); // 近段（system 与已摘要段之后）
-  if (lastPromptTokens > trimThreshold) recent = trimOldToolOutputs(recent);
+  if (lastPromptTokens > trimThreshold) recent = trimOldToolOutputs(ops, recent);
   ctx.push(...recent);
   return ctx;
 }
 
+/** OpenAI 方言绑定版（手写引擎 / UI 直接用，签名不变）。 */
+export const buildContext = (s: CompressState): OAIMessage[] =>
+  buildContextWith(oaiOps, s);
+
 // ———————————————————— 折叠（compaction）逻辑：纯函数，LLM 调用由外层注入 ————————————————————
 
 /** 是否该折叠：投影大小超过 budget*summarizeFrac。 */
-export function shouldCompact(s: CompressState): boolean {
+export function shouldCompact(s: CompressState<unknown>): boolean {
   return s.lastPromptTokens > budget * summarizeFrac;
 }
 
@@ -141,9 +166,12 @@ export function shouldCompact(s: CompressState): boolean {
  * 到「最近窗口起点」之前的完整若干轮折成一段。start 一定是 user（轮起点），
  * end 一定是某轮最后一条 → 区间是若干完整轮，绝不切断 tool_call/tool 对。
  */
-export function pickCompactionRange(s: CompressState): [number, number] | null {
+export function pickCompactionRangeWith<M>(
+  ops: MessageOps<M>,
+  s: CompressState<M>
+): [number, number] | null {
   const { messages, summarizedUpTo: k } = s;
-  const userIdx = messages.flatMap((m, i) => (m.role === "user" ? [i] : []));
+  const userIdx = messages.flatMap((m, i) => (ops.role(m) === "user" ? [i] : []));
   if (userIdx.length <= keepRecentTurns) return null; // 还没攒够轮数
   const recentStart = userIdx[userIdx.length - keepRecentTurns]!; // 最近窗口起点(user)
   const start = k + 1;
@@ -152,9 +180,13 @@ export function pickCompactionRange(s: CompressState): [number, number] | null {
   return [start, end];
 }
 
+/** OpenAI 方言绑定版。 */
+export const pickCompactionRange = (s: CompressState): [number, number] | null =>
+  pickCompactionRangeWith(oaiOps, s);
+
 /** 把一段摘要追加进状态（append-only），推进水位线。 */
 export function applyCompaction(
-  s: CompressState,
+  s: CompressState<unknown>,
   range: [number, number],
   text: string
 ): void {
@@ -165,18 +197,18 @@ export function applyCompaction(
 // ———————————————————— 分级折叠（层 B 触顶）：把若干旧摘要再折一层 ————————————————————
 
 /** 摘要本身占的 token 估算超过 budget*foldFrac → 该做二级折叠。 */
-export function shouldFold(s: CompressState): boolean {
+export function shouldFold(s: CompressState<unknown>): boolean {
   const tok = s.summaries.reduce((n, seg) => n + roughTokens(seg.text), 0);
   return tok > budget * foldFrac;
 }
 
 /** 当前摘要里的最高层级（0=无摘要，1=一级，2=二级…）。用于软提示判断。 */
-export function maxSummaryLevel(s: CompressState): number {
+export function maxSummaryLevel(s: CompressState<unknown>): number {
   return s.summaries.reduce((mx, x) => Math.max(mx, x.level), 0);
 }
 
 /** ctx 偏大或出现高层摘要 → 该软提示用户。 */
-export function shouldWarn(s: CompressState): boolean {
+export function shouldWarn(s: CompressState<unknown>): boolean {
   return s.lastPromptTokens > budget * warnFrac || maxSummaryLevel(s) >= 2;
 }
 
@@ -184,7 +216,7 @@ export function shouldWarn(s: CompressState): boolean {
  * 选出要再折一层的「最旧、连续、同最低层级」的一组摘要段。
  * 返回 [i, j]（含）或 null。folds 是把 segs[i..j] 这组合并成一条更高层级的段。
  */
-export function pickFoldGroup(s: CompressState): [number, number] | null {
+export function pickFoldGroup(s: CompressState<unknown>): [number, number] | null {
   const segs = s.summaries;
   if (segs.length < foldGroupSize) return null;
   const minLevel = Math.min(...segs.map((x) => x.level));
@@ -202,7 +234,7 @@ export function pickFoldGroup(s: CompressState): [number, number] | null {
 
 /** 用合并后的文本，把 segs[i..j] 这组替换成一条更高层级的摘要段。 */
 export function applyFold(
-  s: CompressState,
+  s: CompressState<unknown>,
   group: [number, number],
   text: string
 ): void {
