@@ -6,6 +6,7 @@ import {
   statefulTools,
   needsApproval,
   describeForApproval,
+  ruleRisk,
   type ToolCtx,
 } from "./tools.js";
 import { createRunLogger, type RunLogger } from "./logger.js";
@@ -309,6 +310,26 @@ export function createSession(): Session {
   };
 }
 
+/**
+ * 把 source 会话的【全部】字段装进 target（原地、保持对象引用不变）。
+ * UI 层的 /new、/clear、切换会话都必须走这里——曾经三处各自手抄字段列表，
+ * 结果压缩状态（summaries/summarizedUpTo/memory）被漏掉：旧会话的摘要挂到
+ * 新会话上、水位线越界切空近段、还会把旧摘要持久化进新会话存档。
+ */
+export function adoptSession(target: Session, source: Session): void {
+  target.id = source.id;
+  target.createdAt = source.createdAt;
+  target.logger = source.logger;
+  target.round = source.round;
+  target.lastPromptTokens = source.lastPromptTokens;
+  target.messages.length = 0;
+  target.messages.push(...source.messages);
+  target.summaries = source.summaries;
+  target.summarizedUpTo = source.summarizedUpTo;
+  target.memory = source.memory;
+  target.plan = source.plan;
+}
+
 /** 从存盘记录恢复一个会话：沿用其 id 与历史，重开一份运行日志。 */
 export function resumeSession(stored: StoredSession): Session {
   const logger = createRunLogger();
@@ -380,7 +401,8 @@ function renderTranscript(slice: Message[]): string {
  * 顺带抽取「需长期记住的稳定事实」放进外置记忆（层 C），用 JSON 输出，防御式解析。
  */
 async function summarizeChunk(
-  slice: Message[]
+  slice: Message[],
+  signal?: AbortSignal
 ): Promise<{ summary: string; facts: string[] }> {
   const res = await client.chat.completions.create({
     model: MODEL,
@@ -396,7 +418,7 @@ async function summarizeChunk(
       },
       { role: "user", content: "对话片段：\n\n" + renderTranscript(slice) },
     ],
-  });
+  }, { signal }); // 接中断信号：Ctrl+C 时内部 LLM 调用也随之取消
   const raw = res.choices[0]?.message?.content?.trim() ?? "";
   try {
     const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
@@ -419,7 +441,8 @@ async function summarizeChunk(
  */
 async function judgeRisk(
   name: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  signal?: AbortSignal
 ): Promise<{ risky: boolean; reason: string }> {
   try {
     const res = await client.chat.completions.create({
@@ -436,7 +459,7 @@ async function judgeRisk(
         },
         { role: "user", content: `工具: ${name}\n参数: ${JSON.stringify(args)}` },
       ],
-    });
+    }, { signal });
     const raw = res.choices[0]?.message?.content?.trim() ?? "";
     const o = JSON.parse(raw.replace(/^```json\s*|\s*```$/g, "")) as {
       risky?: unknown;
@@ -452,7 +475,7 @@ async function judgeRisk(
 }
 
 /** 把若干旧摘要再合并浓缩成更高层级的一条（分级折叠的那次 LLM 调用）。 */
-async function summarizeTexts(texts: string[]): Promise<string> {
+async function summarizeTexts(texts: string[], signal?: AbortSignal): Promise<string> {
   const res = await client.chat.completions.create({
     model: MODEL,
     messages: [
@@ -467,17 +490,21 @@ async function summarizeTexts(texts: string[]): Promise<string> {
         content: texts.map((t, i) => `[摘要${i + 1}]\n${t}`).join("\n\n"),
       },
     ],
-  });
+  }, { signal });
   return res.choices[0]?.message?.content?.trim() || texts.join(" / ");
 }
 
 /** 分级折叠（层 B 触顶）：摘要本身太大时，把最旧的若干段再折一层，必要时软提示。 */
-async function maybeFold(session: Session, emit: Emitter): Promise<void> {
+async function maybeFold(
+  session: Session,
+  emit: Emitter,
+  signal?: AbortSignal
+): Promise<void> {
   while (shouldFold(session)) {
     const group = pickFoldGroup(session);
     if (!group) break;
     const texts = session.summaries.slice(group[0], group[1] + 1).map((x) => x.text);
-    const text = await summarizeTexts(texts);
+    const text = await summarizeTexts(texts, signal);
     applyFold(session, group, text);
     session.logger.section(`🗜🗜 二级折叠 摘要段[${group[0]}..${group[1]}]`);
     session.logger.log(text);
@@ -496,7 +523,11 @@ async function maybeFold(session: Session, emit: Emitter): Promise<void> {
 }
 
 /** 轮边界检查：上下文偏大时，把最旧的若干完整轮折叠成一段摘要（一次 LLM 调用）。 */
-async function maybeCompact(session: Session, emit: Emitter): Promise<void> {
+async function maybeCompact(
+  session: Session,
+  emit: Emitter,
+  signal?: AbortSignal
+): Promise<void> {
   if (!shouldCompact(session)) return;
   const range = pickCompactionRange(session);
   if (!range) return;
@@ -505,7 +536,7 @@ async function maybeCompact(session: Session, emit: Emitter): Promise<void> {
     type: "debug",
     text: `🗜 折叠 messages[${range[0]}..${range[1]}]（${slice.length} 条）成摘要 …`,
   });
-  const { summary, facts } = await summarizeChunk(slice);
+  const { summary, facts } = await summarizeChunk(slice, signal);
   applyCompaction(session, range, summary);
   for (const f of facts)
     if (!session.memory.includes(f)) session.memory.push(f); // 外置记忆去重追加
@@ -522,7 +553,7 @@ async function maybeCompact(session: Session, emit: Emitter): Promise<void> {
       (facts.length ? `，记住 ${facts.length} 条事实` : "") +
       "（ctx 下降）",
   });
-  await maybeFold(session, emit); // 摘要本身若过大，再折一层
+  await maybeFold(session, emit, signal); // 摘要本身若过大，再折一层
 }
 
 /**
@@ -545,7 +576,7 @@ export async function runAgent(
   persist(session); // 先记下用户这轮（即使中途被中断也不丢）
 
   // 轮边界：上下文偏大就先把最旧的若干完整轮折叠成摘要，再开始这一轮（不折当前在飞轮）。
-  await maybeCompact(session, emit);
+  await maybeCompact(session, emit, signal);
 
   // 最大轮数上限，防止模型陷入死循环（见 config.maxTurns，env: MAX_TURNS）。
   const MAX_TURNS = config.maxTurns;
@@ -560,7 +591,10 @@ export async function runAgent(
     logger.section(
       `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${session.lastPromptTokens} tok）`
     );
-    logger.log(JSON.stringify(ctx, null, 2));
+    // 全量投影 JSON 每轮重复全部历史（日志 O(n²) 膨胀），只在协议研究模式下记；
+    // 平时记 role 时间线就够定位问题了。
+    if (config.traceStream) logger.log(JSON.stringify(ctx, null, 2));
+    else logger.log(timeline(ctx));
 
     // —— think（流式）——
     const { assistantMsg, finishReason, usage } = await streamModel(
@@ -642,7 +676,9 @@ export async function runAgent(
     }
 
     // 阶段 2b：判定每个危险工具要不要确认。无人值守(autoApprove)直接放行；
-    // strict：危险工具一律确认；auto：让模型判风险（可并行判），只有有风险才确认。
+    // strict：危险工具一律确认；auto：先过确定性规则（rm/sudo/重定向/外联等，
+    // 命中直接要确认——LLM 判官可能被工具输出里的提示注入带偏，规则不会），
+    // 规则放行的再让模型判风险（可并行判），只有有风险才确认。
     const interactive = approve !== autoApprove;
     const needConfirm: boolean[] = toolCalls.map(() => false);
     const riskReason: string[] = toolCalls.map(() => "");
@@ -655,9 +691,15 @@ export async function runAgent(
             needConfirm[i] = true;
             return;
           }
-          const { risky, reason } = await judgeRisk(name, parsed[i]!);
+          const rule = ruleRisk(name, parsed[i]!);
+          if (rule) {
+            needConfirm[i] = true;
+            riskReason[i] = `规则判定：${rule}`;
+            return;
+          }
+          const { risky, reason } = await judgeRisk(name, parsed[i]!, signal);
           needConfirm[i] = risky;
-          riskReason[i] = reason;
+          riskReason[i] = risky ? `模型判定：${reason}` : "";
           if (!risky)
             emit({ type: "note", text: `✓ 自动放行 ${name}（低风险：${reason}）` });
         })
@@ -669,7 +711,7 @@ export async function runAgent(
       if (results[i] !== null || !needConfirm[i]) continue;
       const { name, arguments: rawArgs } = toolCalls[i]!.function;
       const preview =
-        (riskReason[i] ? `[风险] 模型判定：${riskReason[i]}\n` : "") +
+        (riskReason[i] ? `[风险] ${riskReason[i]}\n` : "") +
         (await describeForApproval(name, parsed[i]!));
       if (!(await approve({ name, argsText: rawArgs, preview })))
         results[i] = "用户拒绝执行该工具调用。请换一种不需要该操作的方式，或询问用户。";
@@ -704,6 +746,9 @@ export async function runAgent(
       logger.log(`[tool] ${call.function.name}(${call.function.arguments}) => ${results[i]}`);
       messages.push({ role: "tool", tool_call_id: call.id, content: results[i]! });
     }
+    // 每轮 tool 结果写回后就落一次盘：长任务中途网络报错/崩溃时，
+    // 已执行的轮次不丢（否则只有最终答案时才 persist，尾巴全没）。
+    persist(session);
     // 带着新的 observation 回到循环顶部，再次 think。
   }
 
