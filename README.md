@@ -6,6 +6,88 @@ Phase 3 加入了 **LangGraph 引擎**（现为默认）：同一个 UI、同一
 `ENGINE=handwritten` 一键切回手写循环做对照（见 `docs/langgraph-vs-handwritten.md`）。
 同一个会话可以两个引擎交替接续。
 
+## 系统架构
+
+```mermaid
+graph TB
+    subgraph 入口层
+        CLI["index.ts<br/>入口/路由"]
+    end
+
+    subgraph UI层
+        Ink["ui.tsx<br/>Ink 终端 UI"]
+        Console["console emitter<br/>一次性/管道模式"]
+    end
+
+    subgraph 引擎层
+        Seam["engine.ts<br/>引擎接缝"]
+        HW["agent.ts<br/>手写循环引擎"]
+        LG["lgraph/<br/>LangGraph 引擎"]
+    end
+
+    subgraph 核心服务
+        LLM["llm.ts<br/>DeepSeek 客户端"]
+        Tools["tools.ts<br/>工具注册表+风险规则"]
+        Compress["compress.ts<br/>上下文压缩"]
+        Todo["todo.ts<br/>任务清单"]
+    end
+
+    subgraph 持久化
+        Store["store.ts<br/>会话 JSON 存档"]
+        Logger["logger.ts<br/>运行日志"]
+    end
+
+    CLI --> Ink
+    CLI --> Console
+    Ink --> Seam
+    Console --> Seam
+    Seam --> HW
+    Seam --> LG
+    HW --> LLM
+    HW --> Tools
+    HW --> Compress
+    LG --> LLM
+    LG --> Tools
+    LG --> Compress
+    HW --> Todo
+    LG --> Todo
+    HW --> Store
+    HW --> Logger
+    LG --> Store
+    LG --> Logger
+```
+
+### 双引擎对照
+
+`engine.ts` 根据 `ENGINE` 环境变量分派到两个实现，共享同一套 UI、会话存档和工具注册表：
+
+```mermaid
+graph LR
+    subgraph 手写引擎
+        HW_Loop["agent.ts<br/>think→act→observe<br/>TypeScript 循环<br/>手动管理状态"]
+    end
+    subgraph LangGraph 引擎
+        LG_Graph["lgraph/graph.ts<br/>5 节点状态图<br/>compact → agent → judge<br/>→ approve → tools"]
+        LG_Check["Checkpointer<br/>自动存档/恢复"]
+    end
+    subgraph 共享层
+        Shared["同一套工具 / 压缩 / LLM / 会话存档 / UI"]
+    end
+
+    HW_Loop --> Shared
+    LG_Graph --> Shared
+    LG_Graph --> LG_Check
+```
+
+| 对比维度 | 手写引擎 | LangGraph 引擎 |
+|---------|---------|---------------|
+| 循环控制 | 手写 `while` + `for` | 图节点 + 条件边 |
+| 状态管理 | `Session` 对象 | `StateGraph` 通道 |
+| 确认门 | `promptApproval()` 函数 | `interrupt()` + `Command` |
+| 重放/分叉 | 需自己实现 | Checkpointer 原生支持 |
+
+详见 [`docs/langgraph-vs-handwritten.md`](docs/langgraph-vs-handwritten.md)。
+
 ## 快速开始
 
 ```bash
@@ -45,6 +127,21 @@ ENGINE=handwritten npm run dev    # 切回手写引擎跑（其余用法完全�
 
 `run_bash` / `write_file` / `edit_file` 是危险工具，交互模式下执行前可能弹确认框
 （展示命令或 diff 预览，y/n 拍板）：
+
+```mermaid
+flowchart TD
+    Tool["🔧 危险工具调用"] --> TTY{"交互模式?"}
+    TTY -- 否（管道/一次性） --> AutoAllow["✅ 自动放行"]
+    TTY -- 是 --> Mode{"APPROVAL_MODE"}
+    Mode -- strict --> Confirm["🛑 弹确认框 y/n"]
+    Confirm -- y --> Exec["⚡ 执行"]
+    Confirm -- n --> Block["🚫 注入拒绝 observation"]
+    Mode -- auto --> Rule{"确定性规则检查<br/>rm / sudo / curl|sh<br/>git push -f / 写cwd外…"}
+    Rule -- 命中 --> Confirm
+    Rule -- 放行 --> LLMJudge["🤖 模型判风险"]
+    LLMJudge -- 高风险 --> Confirm
+    LLMJudge -- 低风险 --> Exec
+```
 
 - **auto**（默认）：先过一层**确定性规则**（rm / sudo / 重定向写文件 / curl|sh /
   git push --force / 写 cwd 之外……命中一律要确认，不受提示注入影响），
@@ -94,12 +191,45 @@ npm run build      # 编译到 dist/（tsconfig.build.json，不含测试）
 
 ## 核心原理（看代码时重点理解）
 
+每轮用户输入进入 `think → act → observe` 循环，直到模型不再请求工具、输出最终答案：
+
+```mermaid
+flowchart TD
+    Start(["用户输入"]) --> Think["🧠 Think<br/>模型返回 text 或 tool_calls"]
+    Think --> HasTools{"有 tool_calls?"}
+    HasTools -- 否 --> Done(["✅ 输出最终答案"])
+    HasTools -- 是 --> Safety{"危险工具?<br/>(run_bash/write/edit)"}
+    Safety -- 是 --> Approve{"确认门<br/>规则 + 模型判风险"}
+    Approve -- 拒绝 --> Reject["注入错误 observation<br/>继续循环"]
+    Reject --> Think
+    Approve -- 放行 --> Act["⚡ Act<br/>本地执行工具函数"]
+    Safety -- 否 --> Act
+    Act --> Observe["👁 Observe<br/>工具结果 role:tool 回传"]
+    Observe --> MaxTurn{"超过 MAX_TURNS?"}
+    MaxTurn -- 是 --> ForceDone(["⚠️ 强制终止"])
+    MaxTurn -- 否 --> Think
+```
+
 - **模型只「请求」工具，代码才真正执行**：`agent.ts` 里检测 `tool_calls`，本地跑注册表里的实现。
 - **API 无状态**：每一轮都把完整 `messages` 历史重新传给模型。
 - **observation 回传规则**：工具结果用 `role:"tool"`，且 `tool_call_id` 必须和模型的请求一一对应。
 - **循环出口**：模型某轮不再返回 `tool_calls` → 那就是最终自然语言答案。
 - **投影式压缩**：`messages` 真相源永不删改；发送前套 `buildContext` 生成投影
   （外置记忆 + 旧段摘要 + 近段原文），细节见 `docs/context-compression.md`。
+
+```mermaid
+flowchart LR
+    Truth["💾 messages<br/>真相源永不删改"] --> Build["buildContext()<br/>构建投影"]
+    Build --> Check{"token 超<br/>CTX_BUDGET?"}
+    Check -- 否 --> Pass["📤 全量发送"]
+    Check -- 是 --> Strategy["选择压缩策略"]
+    Strategy --> Trim["✂️ 裁旧工具输出"]
+    Strategy --> Summarize["📝 分段 LLM 摘要"]
+    Strategy --> Fold["📁 分级折叠<br/>近段原文<br/>中段摘要<br/>远段记忆"]
+    Trim --> Send["📤 投影发送"]
+    Summarize --> Send
+    Fold --> Send
+```
 
 ## 配置（env 覆盖，详见 src/config.ts）
 
