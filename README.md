@@ -1,10 +1,29 @@
-# Galaude — 从零手写的 Agent 编排器（学习向）
+# Galaude — 从零实现的 AI 编程工具（学习向）
 
-不用任何框架，用 TypeScript 实现 `think → act → observe` 循环，吃透 function calling 和 agent 编排的底层原理。模型用 DeepSeek（OpenAI 兼容协议）。
+一个跑在本机终端的 AI 编程助手——能读代码、写文件、改文件、跑 shell 命令、
+算数学表达式、管理任务清单，自动执行多步编程任务。**不用任何 Agent 框架**，
+纯 TypeScript 从零手写 `think → act → observe` 循环，吃透 function calling
+和 agent 编排底层原理。模型用 DeepSeek（OpenAI 兼容协议）。
 
 Phase 3 加入了 **LangGraph 引擎**（现为默认）：同一个 UI、同一份会话存档，
 `ENGINE=handwritten` 一键切回手写循环做对照（见 `docs/langgraph-vs-handwritten.md`）。
 同一个会话可以两个引擎交替接续。
+
+## 它能做什么
+
+```
+> 帮我给 src/tools.ts 加一个 create_dir 工具
+（Agent 自动读文件 → 理解现有结构 → edit_file 插入新函数 → 更新注册表 → 完成）
+
+> npm test 有3个失败，帮我修一下
+（Agent 自动跑测试 → 读报错 → 定位源码 → 修代码 → 再跑测试验证）
+
+> 把 compress.ts 里的 buildContext 拆成两个小函数
+（Agent 先理解函数逻辑 → 规划拆分方案 → todowrite 列出步骤 → 逐步 edit_file）
+```
+
+本质是让大模型**操控你的本机**：它能读写文件、执行命令、管理任务清单——
+你自己写好 system prompt 和工具定义，模型就按你的规范来干活。
 
 ## 系统架构
 
@@ -94,12 +113,20 @@ graph LR
 npm install
 cp .env.example .env        # 然后填入你的 DEEPSEEK_API_KEY
 
-npm run dev                 # 进入多轮对话（Ink 终端 UI，输入框固定底部）
-npm run dev -- "帮我算 (3+4)*5"   # 一次性模式：跑一句就退出
+# 交互模式：进入终端 UI 对话
+npm run dev
+
+# 一次性模式：直接给一句指令，跑完退出
+npm run dev -- "帮我给 src/tools.ts 加一个 read_file 工具"
+npm run dev -- "跑一下 npm test 看看有没有失败的用例"
+npm run dev -- "把 src/compress.ts 里的 buildContext 函数重构拆成两个"
+
+# 接续历史会话
 npm run dev -- --continue   # 接续最近一次会话
 npm run dev -- --resume <id># 接续指定会话（id 可只给前缀）
 
-ENGINE=handwritten npm run dev    # 切回手写引擎跑（其余用法完全一样；默认 langgraph）
+# 切回手写引擎对照
+ENGINE=handwritten npm run dev
 ```
 
 会话会自动存盘到 `sessions/<id>.json`（元信息进 `sessions/index.json` 轻量索引），
@@ -189,9 +216,11 @@ npm run build      # 编译到 dist/（tsconfig.build.json，不含测试）
 ./deploy.sh        # build 后用 node 跑 dist/（接近上线形态）
 ```
 
-## 核心原理（看代码时重点理解）
+## 工作原理
 
-每轮用户输入进入 `think → act → observe` 循环，直到模型不再请求工具、输出最终答案：
+每次你给一句指令，Galaude 进入 `think → act → observe` 循环：模型先想（可能请求工具），
+代码在本机实际执行（读文件、跑命令、改代码），结果回传给模型继续想——直到模型认为任务完成，
+输出最终答案。
 
 ```mermaid
 flowchart TD
