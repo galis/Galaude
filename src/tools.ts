@@ -6,6 +6,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import { renderMemory, normalizeMemory } from "./memory.js";
+import { scanSkills, loadSkill, renderSkillList, renderSkillPrompts } from "./skill.js";
 import { loadGlobalMemory, saveGlobalMemory } from "./store.js";
 import type { AgentEvent } from "./agent.js";
 
@@ -147,6 +148,39 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ["facts"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "skillread",
+      description:
+        "列出所有可用 skill（可命名的 system prompt 扩展片段）。" +
+        "返回 name + 一句话描述，不加载完整 prompt——渐进式披露，先看有哪些。",
+      parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "skillactivate",
+      description:
+        "激活指定 skill 列表（全量替换当前激活集，空数组=关闭所有）。" +
+        "激活后 skill 的 prompt 片段会每轮注入上下文，改变 agent 的行为模式。" +
+        "例如激活 review → agent 以「代码审查」模式工作；激活 commit → 按规范生成提交信息。" +
+        "可同时激活多个 skill（如 [\"code/review\", \"git/commit\"]），它们按序注入 prompt。",
+      parameters: {
+        type: "object",
+        properties: {
+          skills: {
+            type: "array",
+            description: "要激活的 skill 名列表（全量替换），如 [\"review\", \"debug\"]",
+            items: { type: "string" },
+          },
+        },
+        required: ["skills"],
         additionalProperties: false,
       },
     },
@@ -348,6 +382,7 @@ export const pureTools: Record<string, ToolImpl> = {
 // —— 有状态工具（todo）：拿到 ctx，可读写会话任务计划、发 UI 事件（见 D3）——
 export interface ToolCtx {
   plan: TodoPlan; // 会话任务计划，按引用传入（只暴露这一块 → 最小权限）
+  activeSkills: string[]; // 当前激活的 skill 名列表，按引用传入
   emit: (e: AgentEvent) => void;
   finishReason: string | null; // 本轮模型 finish_reason，用于截断自守（F1）
 }
@@ -377,6 +412,34 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
       renderMemory(r.facts) +
       (notes.length ? "\n（注：" + notes.join("；") + "）" : "")
     );
+  },
+
+  skillread(_args, _ctx) {
+    const list = scanSkills();
+    return renderSkillList(list);
+  },
+
+  skillactivate({ skills }, ctx) {
+    if (!Array.isArray(skills)) throw new Error("skills 必须是数组");
+    const names: string[] = skills.filter((s): s is string => typeof s === "string" && s.trim().length > 0);
+    // 校验每个 skill 是否存在
+    const loaded = [];
+    for (const name of names) {
+      try {
+        loaded.push(loadSkill(name));
+      } catch (err) {
+        throw new Error(`skill ${name} 不存在（${err instanceof Error ? err.message : String(err)}）`);
+      }
+    }
+    // 全量替换
+    ctx.activeSkills.length = 0;
+    ctx.activeSkills.push(...names);
+    ctx.emit({ type: "skills", skills: [...ctx.activeSkills] });
+    ctx.emit({ type: "note", text: `🎯 已激活 skill: ${names.length ? names.join(", ") : "（无）"}` });
+    const prompts = renderSkillPrompts(loaded);
+    return names.length
+      ? `已激活 ${names.length} 个 skill:\n${prompts.join("\n\n")}`
+      : "已关闭所有 skill。";
   },
 
   todoread(_args, ctx) {

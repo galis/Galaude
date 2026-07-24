@@ -37,6 +37,7 @@ export interface StoredSession extends SessionMeta {
   memory?: string[];
   // —— 任务清单（模型驱动，恢复零重放）——
   plan?: TodoPlan;
+  activeSkills?: string[]; // 已激活的 skill 名列表
 }
 
 const pad = (n: number, w = 2) => String(n).padStart(w, "0");
