@@ -2,12 +2,9 @@
 //（env: ENGINE=langgraph 切换）。两个引擎同签名、同事件协议（AgentEvent）、同会话
 // 存档格式——这正是 Phase 3「对照手写逻辑」的支点：同一个界面，两套实现可逐项对比。
 import { config } from "./config.js";
-import {
-  runAgent as runHandwritten,
-  type Session,
-  type Emitter,
-  type ToolApprover,
-} from "./agent.js";
+import { runAgent as runHandwritten } from "./agent.js";
+import { type Session } from "./session.js";
+import { type Emitter, type ToolApprover } from "./events.js";
 
 export async function runAgent(
   session: Session,

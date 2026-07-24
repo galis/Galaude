@@ -35,11 +35,7 @@ import {
   ruleRisk,
   type ToolCtx,
 } from "../tools.js";
-import {
-  getApprovalMode,
-  type Emitter,
-  type ApprovalRequest,
-} from "../agent.js";
+import { getApprovalMode, type Emitter, type ApprovalRequest } from "../events.js";
 import type { RunLogger } from "../logger.js";
 import {
   buildContextWith,

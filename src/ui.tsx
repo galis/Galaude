@@ -1,16 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
-import {
-  createSession,
-  resumeSession,
-  adoptSession,
-  persist,
-  getApprovalMode,
-  setApprovalMode,
-  type Session,
-  type Emitter,
-  type ApprovalRequest,
-} from "./agent.js";
+import { createSession, resumeSession, adoptSession, persist, type Session } from "./session.js";
+import { getApprovalMode, setApprovalMode, type Emitter, type ApprovalRequest } from "./events.js";
 import { runAgent } from "./engine.js"; // 引擎接缝：ENGINE=langgraph 可切换实现
 import {
   listSessions,

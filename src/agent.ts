@@ -9,7 +9,7 @@ import {
   ruleRisk,
   type ToolCtx,
 } from "./tools.js";
-import { createRunLogger, type RunLogger } from "./logger.js";
+import { type RunLogger } from "./logger.js";
 import { config } from "./config.js";
 import {
   RISK_JUDGE_SYSTEM,
@@ -18,9 +18,7 @@ import {
   parseRisk,
   parseSummary,
 } from "./llmtasks.js";
-import { newSessionId, saveSession, loadGlobalMemory, type StoredSession } from "./store.js";
-import { emptyPlan, type Todo, type TodoPlan } from "./todo.js";
-import { ensureUserSkills } from "./skill.js";
+import { loadGlobalMemory } from "./store.js";
 import {
   buildContext,
   shouldCompact,
@@ -30,80 +28,20 @@ import {
   pickFoldGroup,
   applyFold,
   shouldWarn,
-  type SummarySegment,
 } from "./compress.js";
+import {
+  makeConsoleEmitter,
+  getApprovalMode,
+  type Emitter,
+  type ApprovalRequest,
+  type ToolApprover,
+} from "./events.js";
+import { persist, type Session } from "./session.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
-// 调试开关（见 config.ts）。
-const DEBUG = config.debug;
-
-/**
- * agent 把「该显示给用户的东西」抽象成事件，由外层（控制台 or Ink UI）决定怎么渲染。
- * 这样 agent 核心不直接写屏，Ink 接管屏幕时才不会被 console.log 冲乱。
- * 文件日志（logger）与此独立，照常写。
- */
-export type AgentEvent =
-  | { type: "reasoning"; text: string } // 思维链增量
-  | { type: "assistant"; text: string } // 回答正文增量
-  | { type: "tool_call"; name: string; argsText: string }
-  | { type: "tool_result"; name: string; result: string }
-  | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
-  | { type: "note"; text: string } // 系统提示（如「已折叠」），界面当一条 note 显示
-  | { type: "todos"; todos: Todo[] } // 任务清单变更，界面据此刷新面板
-  | { type: "debug"; text: string };
-export type Emitter = (ev: AgentEvent) => void;
-
-// 工具确认门（human-in-the-loop）：危险工具执行前问用户要不要跑。
-// 返回 true 执行、false 拒绝。默认放行（一次性/管道模式无人值守）。
-export type ApprovalRequest = {
-  name: string;
-  argsText: string;
-  preview: string; // 给用户看的可读预览（命令 / diff）
-};
-export type ToolApprover = (req: ApprovalRequest) => Promise<boolean>;
+/** 无人值守时（一次性/管道模式）默认放行所有工具。 */
 const autoApprove: ToolApprover = async () => true;
-
-// 确认门模式（进程级运行时设置，默认取 config，可用 /mode 切换）。
-export type ApprovalMode = "auto" | "strict";
-let approvalMode: ApprovalMode = config.approvalMode;
-export const getApprovalMode = (): ApprovalMode => approvalMode;
-export const setApprovalMode = (m: ApprovalMode): void => {
-  approvalMode = m;
-};
-
-/** 默认事件渲染：写到控制台（一次性 / 管道模式用），尽量还原老输出。 */
-export function makeConsoleEmitter(): Emitter {
-  let answerStarted = false;
-  return (ev) => {
-    switch (ev.type) {
-      case "reasoning":
-        if (DEBUG) process.stdout.write(ev.text);
-        break;
-      case "assistant":
-        if (!answerStarted)
-          (process.stdout.write("\n🤖 "), (answerStarted = true));
-        process.stdout.write(ev.text);
-        break;
-      case "tool_call":
-        answerStarted = false;
-        console.log(`\n🔧 模型请求工具: ${ev.name}(${ev.argsText})`);
-        break;
-      case "tool_result":
-        console.log(`   ↳ 结果: ${ev.result}`);
-        break;
-      case "usage":
-        break; // 控制台模式不显示 ctx 占比
-      case "note":
-        console.log(ev.text);
-        break;
-      case "debug":
-        if (DEBUG) console.log(ev.text);
-        break;
-    }
-  };
-}
-
 // 把整条历史压成一行 role 时间线，最直观地看出循环在怎么推进：
 // system → user → assistant → tool → assistant → ...
 function timeline(messages: Message[]): string {
@@ -271,123 +209,6 @@ async function streamModel(
     logger.log(`[拼好的 tool_calls]\n${JSON.stringify(toolCalls, null, 2)}`);
 
   return { assistantMsg, finishReason, usage };
-}
-
-export const SYSTEM_PROMPT =
-  "你是一个 AI 编程 Agent 助手，帮用户在本机完成编程相关任务。可用工具：" +
-  "read_file 读文件、write_file 写/建文件、edit_file 精确改文件" +
-  "（这三类文件操作一律用专门工具，不要用 run_bash 的 cat/echo/sed）；" +
-  "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算；" +
-  "todowrite/todoread 维护多步任务清单；" +
-  "memoryread/memorywrite 读写长期记忆（用户偏好、项目约定、关键决定等）。" +
-  "【Skill 规则】上下文中的「可用 Skills」列表常驻注入，展示每个 skill 的名+描述+文件路径。" +
-  "当你判断某个 skill 的描述与当前任务匹配时，用 read_file 读取对应 .md 文件加载完整提示，" +
-  "然后按照 skill 中的规范执行。不要凭空猜测 skill 的内容。" +
-  "【任务清单规则】多步任务必须先用 todowrite 列出完整计划，再把第一项标为 in_progress 开始执行。" +
-  "每做完一项立即用 todowrite 标 completed、把下一项标 in_progress，始终保持最多一个 in_progress。" +
-  "开始执行前、不确定进度时先用 todoread 确认当前清单，不要凭记忆猜测。" +
-  "清单会每轮自动回注到上下文，你始终看得见——照着清单推进，不要跳过 todowrite 直接干活。" +
-  "【记忆规则】用户说了值得长期记住的事（偏好、约定、决定、身份信息、项目规则），用 memorywrite 记下来；" +
-  "开始新任务前先用 memoryread 了解背景。记忆是跨会话持久化的，不要记琐碎/临时信息。" +
-  "【通用规则】优先用工具获取真实信息，不要凭空臆测或编造文件内容；" +
-  "完成后用简洁清晰的话回答。";
-
-/** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
-export interface Session {
-  id: string; // 会话 id，对应 sessions/<id>.json
-  createdAt: string;
-  messages: Message[];
-  logger: RunLogger;
-  round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
-  lastPromptTokens: number; // 上轮模型实际看到的 prompt token（投影大小），驱动压缩触发
-  // —— 压缩状态（投影用，messages 始终完整不动）——
-  summaries: SummarySegment[]; // 旧段摘要，append-only
-  summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
-  memory: string[]; // 会话级外置关键事实（P3 自动抽取），豁免压缩
-  globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json），每轮注入前读取
-  plan: TodoPlan; // 任务清单（模型驱动，每轮回注上下文）
-}
-
-/** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
-export function createSession(): Session {
-  const logger = createRunLogger();
-  logger.section("工具定义 toolSchemas（随每轮一起发给模型）");
-  logger.log(JSON.stringify(toolSchemas, null, 2));
-  const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
-  // 首次启动：内置 skill 复制到用户目录（幂等，已有则跳过）
-  try { ensureUserSkills(); } catch { /* 非致命 */ }
-  return {
-    id: newSessionId(),
-    createdAt: new Date().toISOString(),
-    messages,
-    logger,
-    round: 0,
-    lastPromptTokens: 0,
-    summaries: [],
-    summarizedUpTo: 0,
-    memory: [],
-    plan: emptyPlan(),
-  };
-}
-
-/**
- * 把 source 会话的【全部】字段装进 target（原地、保持对象引用不变）。
- * UI 层的 /new、/clear、切换会话都必须走这里——曾经三处各自手抄字段列表，
- * 结果压缩状态（summaries/summarizedUpTo/memory）被漏掉：旧会话的摘要挂到
- * 新会话上、水位线越界切空近段、还会把旧摘要持久化进新会话存档。
- */
-export function adoptSession(target: Session, source: Session): void {
-  target.id = source.id;
-  target.createdAt = source.createdAt;
-  target.logger = source.logger;
-  target.round = source.round;
-  target.lastPromptTokens = source.lastPromptTokens;
-  target.messages.length = 0;
-  target.messages.push(...source.messages);
-  target.summaries = source.summaries;
-  target.summarizedUpTo = source.summarizedUpTo;
-  target.memory = source.memory;
-  target.plan = source.plan;
-}
-
-/** 从存盘记录恢复一个会话：沿用其 id 与历史，重开一份运行日志。 */
-export function resumeSession(stored: StoredSession): Session {
-  const logger = createRunLogger();
-  logger.section(`恢复会话 ${stored.id}（${stored.messages.length} 条历史）`);
-  return {
-    id: stored.id,
-    createdAt: stored.createdAt,
-    messages: stored.messages,
-    logger,
-    round: stored.messages.filter((m) => m.role === "user").length,
-    // 恢复时带上 ctx 大小：这样恢复后第一轮就知道要不要裁，不会先发一坨超大上下文
-    lastPromptTokens: stored.lastPromptTokens ?? 0,
-    // 压缩状态直接读回（零重放）：摘要/水位线/记忆都是固化好的
-    summaries: stored.summaries ?? [],
-    summarizedUpTo: stored.summarizedUpTo ?? 0,
-    memory: stored.memory ?? [],
-    plan: stored.plan ?? emptyPlan(),
-  };
-}
-
-/** 把会话当前状态写盘（sessions/<id>.json），每轮结束自动调用。 */
-export function persist(session: Session): void {
-  const firstUser = session.messages.find((m) => m.role === "user");
-  if (!firstUser) return; // 空会话（还没说过话）不必存盘
-  const title =
-    typeof firstUser.content === "string" ? firstUser.content.slice(0, 50) : "(无标题)";
-  saveSession({
-    id: session.id,
-    createdAt: session.createdAt,
-    updatedAt: new Date().toISOString(),
-    title,
-    messages: session.messages,
-    lastPromptTokens: session.lastPromptTokens,
-    summaries: session.summaries,
-    summarizedUpTo: session.summarizedUpTo,
-    memory: session.memory,
-    plan: session.plan,
-  });
 }
 
 /** 把一段消息渲染成可读「对话稿」喂给摘要器（工具结果截断，控制摘要输入大小）。 */
@@ -668,7 +489,7 @@ export async function runAgent(
         toolCalls.map(async (call, i) => {
           const name = call.function.name;
           if (results[i] !== null || !needsApproval.has(name)) return; // 出错的/安全工具：免确认
-          if (approvalMode === "strict") {
+          if (getApprovalMode() === "strict") {
             needConfirm[i] = true;
             return;
           }

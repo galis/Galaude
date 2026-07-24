@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { createInterface } from "node:readline/promises";
-import { createSession, resumeSession } from "./agent.js";
+import { createSession, resumeSession } from "./session.js";
 import { runAgent } from "./engine.js"; // 引擎接缝：ENGINE=langgraph 可切换实现
 import { latestSession, loadSession } from "./store.js";
 import { contextReport } from "./compress.js";

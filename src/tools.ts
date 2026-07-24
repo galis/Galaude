@@ -7,7 +7,7 @@ import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import { renderMemory, normalizeMemory } from "./memory.js";
 import { loadGlobalMemory, saveGlobalMemory } from "./store.js";
-import type { AgentEvent } from "./agent.js";
+import type { AgentEvent } from "./events.js";
 
 const execFileAsync = promisify(execFile);
 

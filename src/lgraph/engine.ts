@@ -9,14 +9,8 @@
 import { Command, type StateSnapshot } from "@langchain/langgraph";
 import { HumanMessage, ToolMessage } from "@langchain/core/messages";
 import { config } from "../config.js";
-import {
-  makeConsoleEmitter,
-  persist,
-  type Session,
-  type Emitter,
-  type ToolApprover,
-  type ApprovalRequest,
-} from "../agent.js";
+import { makeConsoleEmitter, type Emitter, type ToolApprover, type ApprovalRequest } from "../events.js";
+import { persist, type Session } from "../session.js";
 import { getGraph, setTraceLogger, type GState } from "./graph.js";
 import {
   toLC,
