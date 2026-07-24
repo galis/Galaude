@@ -19,6 +19,7 @@ import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
 import { config } from "./config.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
+import { scanCommands, expandCommand, type CommandMeta } from "./commands.js";
 import type OpenAI from "openai";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -38,8 +39,16 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
 ];
-export const HELP =
-  "可用命令：\n" + COMMANDS.map((c) => `  ${c.name}  ${c.desc}`).join("\n");
+/** 构建帮助文本（含自定义命令，每次调用实时扫描）。 */
+export function buildHelp(): string {
+  const custom = scanCommands().map((c) => ({ name: `/${c.name}`, desc: `${c.description}（自定义）` }));
+  const customNames = new Set(custom.map((c) => c.name));
+  const builtin = COMMANDS.filter((c) => !customNames.has(c.name));
+  const all = [...custom, ...builtin];
+  return "可用命令：\n" + all.map((c) => `  ${c.name}  ${c.desc}`).join("\n");
+}
+// 兼容旧导出（启动时快照，/help 命令用 buildHelp 获取实时列表）
+export let HELP = buildHelp();
 
 // 屏幕上的一条记录。
 type Item =
@@ -135,25 +144,33 @@ function messagesToItems(messages: Message[]): Item[] {
 }
 
 // 输入行上方的实时命令菜单：命中前缀亮绿，其余青色，随输入筛选。
-function CommandMenu({ input }: { input: string }) {
-  const hits = COMMANDS.filter((c) => c.name.startsWith(input));
+// 自定义命令用黄色标记，放在内置命令前面。
+function CommandMenu({ input, customCommands }: { input: string; customCommands: CommandMeta[] }) {
+  const custom = customCommands.map((c) => ({ name: `/${c.name}`, desc: `${c.description}（自定义）` }));
+  const customNames = new Set(custom.map((c) => c.name));
+  const builtin = COMMANDS.filter((c) => !customNames.has(c.name));
+  const all = [...custom, ...builtin];
+  const hits = all.filter((c) => c.name.startsWith(input));
   return (
     <Box flexDirection="column">
       <Text dimColor>── 命令（Enter 执行）──</Text>
       {hits.length === 0 ? (
         <Text dimColor> （无匹配命令）</Text>
       ) : (
-        hits.map((c) => (
-          <Text key={c.name}>
-            {"  "}
-            <Text color="green" bold>
-              {c.name.slice(0, input.length)}
+        hits.map((c) => {
+          const isCustom = customNames.has(c.name);
+          return (
+            <Text key={c.name}>
+              {"  "}
+              <Text color="green" bold>
+                {c.name.slice(0, input.length)}
+              </Text>
+              <Text color={isCustom ? "yellow" : "cyan"}>{c.name.slice(input.length)}</Text>
+              {"  "}
+              <Text dimColor>{c.desc}</Text>
             </Text>
-            <Text color="cyan">{c.name.slice(input.length)}</Text>
-            {"  "}
-            <Text dimColor>{c.desc}</Text>
-          </Text>
-        ))
+          );
+        })
       )}
     </Box>
   );
@@ -198,6 +215,9 @@ function App({ session }: { session: Session }) {
     list: SessionMeta[];
     index: number;
   } | null>(null);
+  // 自定义命令（启动时扫描一次）
+  const [customCommands, setCustomCommands] = useState<CommandMeta[]>([]);
+  useEffect(() => { setCustomCommands(scanCommands()); }, []);
 
   // 切换到某个会话：先存当前，再把目标会话【全部状态】装进来并铺到界面。
   // 整体交接必须走 adoptSession——手抄字段列表漏过压缩状态（摘要/记忆/水位线），
@@ -245,7 +265,7 @@ function App({ session }: { session: Session }) {
       // 会在它还没刷新时把 onSubmit 同步调两次，两个 runAgent 并发写同一份历史。
       // 所以再用 busyRef 做同步守卫（进入跑 agent 分支时立刻置位）。
       if (busy || busyRef.current) return;
-      const text = raw.trim();
+      let text = raw.trim();
       setInput("");
       setCursor(0);
       setScroll(0); // 提交即回到底部跟随
@@ -268,7 +288,10 @@ function App({ session }: { session: Session }) {
         setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
       };
       if (text === "/exit" || text === "/quit") return exit();
-      if (text === "/help") return push({ kind: "note", text: HELP });
+      if (text === "/help") {
+        HELP = buildHelp(); // 每次 /help 实时扫描自定义命令
+        return push({ kind: "note", text: HELP });
+      }
       if (text === "/new") return startFresh("🆕 新会话");
       if (text === "/resume" || text.startsWith("/resume ")) {
         const arg = text.slice("/resume".length).trim();
@@ -338,10 +361,26 @@ function App({ session }: { session: Session }) {
               : "🔁 确认模式：strict —— 危险工具（run_bash/write_file/edit_file）一律确认",
         });
       }
-      if (text.startsWith("/"))
-        return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
+      // —— 自定义命令（/ 开头且不在内置列表中）：展开模板后发送 ——
+      if (text.startsWith("/")) {
+        const cmdName = text.split(/\s+/)[0]!.slice(1);
+        const cmd = customCommands.find((c) => c.name === cmdName);
+        if (cmd) {
+          const arg = text.slice(cmdName.length + 1).trim();
+          const expanded = expandCommand(cmdName, arg);
+          if (!expanded)
+            return push({ kind: "note", text: `❓ 命令模板加载失败: /${cmdName}` });
+          push({ kind: "user", text }); // 屏幕显示原始命令
+          text = expanded; // 传给模型的是展开后的 prompt
+          // 继续走下方 agent 流程
+        } else {
+          return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
+        }
+      }
 
-      push({ kind: "user", text });
+      if (!text.startsWith("/")) { // 非命令：正常 push user 消息
+        push({ kind: "user", text });
+      }
       busyRef.current = true; // 同步置位（见函数开头的守卫说明）
       setBusy(true);
       const ac = new AbortController(); // Ctrl+C 时 abort 它来中断本次生成
@@ -550,9 +589,9 @@ function App({ session }: { session: Session }) {
         } else if (code === 9) {
           // Tab：补全斜杠命令（唯一匹配补全整条，多个补到公共前缀）
           if (inp.startsWith("/")) {
-            const names = COMMANDS.map((c) => c.name).filter((n) =>
-              n.startsWith(inp)
-            );
+            const customNames = customCommands.map((c) => `/${c.name}`);
+            const allNames = [...customNames, ...COMMANDS.map((c) => c.name)];
+            const names = allNames.filter((n) => n.startsWith(inp));
             if (names.length === 1) inp = names[0]!;
             else if (names.length > 1) inp = commonPrefix(names);
             cur = inp.length;
@@ -580,7 +619,9 @@ function App({ session }: { session: Session }) {
 
   const inCmd = input.startsWith("/");
   const menuRows =
-    !busy && inCmd && !approval && !picker ? COMMANDS.length + 1 : 0;
+    !busy && inCmd && !approval && !picker
+      ? customCommands.length + COMMANDS.length + 1
+      : 0;
   // 确认框预览（命令 / diff），最多展示 14 行
   const previewLines = approval ? approval.preview.split("\n").slice(0, 14) : [];
   // 会话选择器：窗口化显示，保证高亮项始终可见
@@ -706,7 +747,7 @@ function App({ session }: { session: Session }) {
       ) : (
         <>
           {/* 命令菜单（仅在输入以 / 开头时） */}
-          {!busy && inCmd ? <CommandMenu input={input} /> : null}
+          {!busy && inCmd ? <CommandMenu input={input} customCommands={customCommands} /> : null}
 
           {/* 输入框：永远在最底部；光标块画在 cursor 位置（支持 ←→ 移动） */}
           <Box>
