@@ -420,7 +420,8 @@ export async function runAgent(
     if (usage) {
       // 记下投影实际大小：下一次 buildContext 据此决定要不要裁（也驱动 UI 的 ctx 占比）。
       session.lastPromptTokens = usage.prompt_tokens;
-      emit({ type: "usage", promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens });
+      const u = usage as unknown as Record<string, number>;
+      emit({ type: "usage", promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, cacheHitTokens: u.prompt_cache_hit_tokens, cacheMissTokens: u.prompt_cache_miss_tokens, timestamp: new Date().toISOString() });
       emit({
         type: "debug",
         text:

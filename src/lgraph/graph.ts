@@ -322,11 +322,19 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
 
   const inTok = acc?.usage_metadata?.input_tokens ?? 0;
   const outTok = acc?.usage_metadata?.output_tokens ?? 0;
+  // DeepSeek 特有字段：prompt_cache_hit_tokens / prompt_cache_miss_tokens
+  // 不在 LangChain 标准 UsageMetadata 类型里，但运行时存在
+  const um = acc?.usage_metadata as Record<string, number> | undefined;
+  const cacheHit = um?.prompt_cache_hit_tokens ?? 0;
+  const cacheMiss = um?.prompt_cache_miss_tokens ?? 0;
   if (inTok > 0) {
-    emit({ type: "usage", promptTokens: inTok, completionTokens: outTok });
+    emit({ type: "usage", promptTokens: inTok, completionTokens: outTok,
+      cacheHitTokens: cacheHit, cacheMissTokens: cacheMiss,
+      timestamp: new Date().toISOString() });
     emit({
       type: "debug",
-      text: `📊 token: prompt=${inTok} completion=${acc?.usage_metadata?.output_tokens ?? "?"} finish_reason=${
+      text: `📊 token: prompt=${inTok} completion=${acc?.usage_metadata?.output_tokens ?? "?"} `
+        + `cache_hit=${cacheHit} cache_miss=${cacheMiss} finish_reason=${
         (aiMsg.response_metadata as { finish_reason?: string }).finish_reason ?? "?"
       }`,
     });

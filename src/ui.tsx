@@ -19,6 +19,7 @@ import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
 import { describeToolBrief } from "./tools.js";
 import { config } from "./config.js";
+import { calcCost, formatCost, peakLabel } from "./billing.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
 import { scanCommands, expandCommand, type CommandMeta } from "./commands.js";
 import type OpenAI from "openai";
@@ -71,6 +72,58 @@ const TODO_ICON: Record<Todo["status"], string> = {
 
 // 把一条 Item 摊成「带样式的行」（Line=Span[]），便于做行级滚动窗口。
 // assistant 内容走 markdown 渲染；其余纯文本套基础样式。
+
+/** 比较新旧文本，返回着色行：删除行红色，增加行绿色。 */
+function coloredDiff(oldText: string, newText: string, max = 16): Line[] {
+  const a = oldText.split("\n");
+  const b = newText.split("\n");
+  let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let ea = a.length;
+  let eb = b.length;
+  while (ea > p && eb > p && a[ea - 1] === b[eb - 1]) (ea--, eb--);
+
+  const lines: Line[] = [];
+  for (const l of a.slice(p, ea)) lines.push([{ text: `  - ${l}`, color: "red" }]);
+  for (const l of b.slice(p, eb)) lines.push([{ text: `  + ${l}`, color: "green" }]);
+
+  if (lines.length === 0) return [[{ text: "  (无变化)", dim: true }]];
+  if (lines.length > max) {
+    return [...lines.slice(0, max), [{ text: "  …(差异较多，已省略)", dim: true }]];
+  }
+  return lines;
+}
+
+/** 生成 edit_file / batch_edit_file 的着色 diff 行（删除红色，增加绿色）。 */
+function toolCallEditLines(
+  name: string,
+  args: Record<string, unknown>
+): Line[] {
+  const lines: Line[] = [];
+
+  if (name === "edit_file") {
+    const p = String(args.path ?? "").trim();
+    const oldS = String(args.old_string ?? "");
+    const newS = String(args.new_string ?? "");
+    lines.push([{ text: `  ${p}`, dim: true }]);
+    lines.push(...coloredDiff(oldS, newS, 10));
+  } else if (name === "batch_edit_file") {
+    const edits =
+      (args.edits as
+        | { path?: string; old_string?: string; new_string?: string }[]
+        | undefined) ?? [];
+    for (const e of edits) {
+      const ep = String(e.path ?? "").trim();
+      const oldS = String(e.old_string ?? "");
+      const newS = String(e.new_string ?? "");
+      lines.push([{ text: `  ${ep}`, dim: true }]);
+      lines.push(...coloredDiff(oldS, newS, 6));
+    }
+  }
+
+  return lines;
+}
+
 function itemLines(it: Item, width: number): Line[] {
   switch (it.kind) {
     case "user":
@@ -82,10 +135,22 @@ function itemLines(it: Item, width: number): Line[] {
       return ls;
     }
     case "tool_call": {
-      const desc = it.argsText
-        ? describeToolBrief(it.name, it.argsText)
-        : it.name;
-      return plainToLines(`🔧 ${desc}`, width, { color: "yellow" });
+      const lines: Line[] = [];
+      lines.push([{ text: `🔧 ${it.name}`, color: "yellow" }]);
+      if (it.argsText) {
+        try {
+          const args = JSON.parse(it.argsText);
+          if (it.name === "edit_file" || it.name === "batch_edit_file") {
+            lines.push(...toolCallEditLines(it.name, args));
+          } else {
+            const desc = describeToolBrief(it.name, it.argsText);
+            lines.push(...plainToLines(desc, width, { dim: true }));
+          }
+        } catch {
+          lines.push(...plainToLines(it.argsText.slice(0, 200), width, { dim: true }));
+        }
+      }
+      return lines;
     }
     case "tool_result":
       return plainToLines(" ↳ " + it.result, width, { color: "green" });
@@ -110,6 +175,12 @@ function itemLines(it: Item, width: number): Line[] {
     case "skill":
       return plainToLines(it.text, width, { color: "yellow" });
   }
+}
+
+// 计费逻辑已迁移到 src/billing.ts（时间感知：高峰 2x，非高峰原价）。
+/** 根据 token 数/模型名算价格字符串（UI 展示用） */
+function calcPrice(model: string, cacheMissTokens: number, cacheHitTokens: number, outputTokens: number): string {
+  return formatCost(calcCost(model, cacheMissTokens, cacheHitTokens, outputTokens));
 }
 
 // 取一组字符串的最长公共前缀（Tab 补全多个候选时用）。
@@ -146,6 +217,43 @@ function messagesToItems(messages: Message[]): Item[] {
     // role:"tool"（工具结果）恢复时不铺到界面——只在日志里
   }
   return out;
+}
+
+// —— 多行输入 ——
+const INPUT_MAX_ROWS = 10; // 输入框最大可见行数
+
+/** 把 input 按 \n 拆成行，返回每行的起始索引 */
+function inputLineStarts(input: string): { lines: string[]; starts: number[] } {
+  const lines = input.split("\n");
+  const starts: number[] = [];
+  let pos = 0;
+  for (const line of lines) {
+    starts.push(pos);
+    pos += line.length + 1; // +1 for \n
+  }
+  return { lines, starts };
+}
+
+/** 草稿光标→(行号, 列号) */
+function cursorToRowCol(input: string, cursor: number): { row: number; col: number } {
+  const { starts } = inputLineStarts(input);
+  let row = starts.length - 1;
+  for (let i = 0; i < starts.length; i++) {
+    if (cursor < starts[i]!) { row = i - 1; break; }
+  }
+  if (row < 0) row = 0;
+  return { row, col: cursor - starts[row]! };
+}
+
+/** (行号, 列号)→草稿光标，自动 clamp 到有效范围 */
+function rowColToCursor(input: string, row: number, col: number): number {
+  const { lines, starts } = inputLineStarts(input);
+  if (row < 0) row = 0;
+  if (row >= lines.length) row = lines.length - 1;
+  const lineLen = lines[row]!.length;
+  if (col < 0) col = 0;
+  if (col > lineLen) col = lineLen;
+  return starts[row]! + col;
 }
 
 // 输入行上方的实时命令菜单：命中前缀亮绿，其余青色，随输入筛选。
@@ -203,6 +311,8 @@ function App({ session }: { session: Session }) {
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
   const [outputTokens, setOutputTokens] = useState(0); // 累积输出 token
   const [inputTokens, setInputTokens] = useState(0); // 累积输入 token（prompt）
+  const [cacheMissTokens, setCacheMissTokens] = useState(0); // 累积缓存未命中 token
+  const [cacheHitTokens, setCacheHitTokens] = useState(0); // 累积缓存命中 token
   const [requestCount, setRequestCount] = useState(0); // 已发请求次数
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
@@ -239,6 +349,8 @@ function App({ session }: { session: Session }) {
       setCtxTokens(ns.lastPromptTokens); // ctx 占比切到目标会话
       setInputTokens(0); // 新会话输入 token 从零开始
       setOutputTokens(0); // 新会话输出 token 从零开始
+      setCacheMissTokens(0); // 新会话缓存 token 从零开始
+      setCacheHitTokens(0);
       setRequestCount(0); // 请求次数从零开始
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
@@ -297,6 +409,8 @@ function App({ session }: { session: Session }) {
         setCtxTokens(0);
         setInputTokens(0);
         setOutputTokens(0);
+        setCacheMissTokens(0);
+        setCacheHitTokens(0);
         setRequestCount(0);
         setTodos([]);
         setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
@@ -415,6 +529,9 @@ function App({ session }: { session: Session }) {
           setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
           setInputTokens((n) => n + ev.promptTokens); // 累积输入 token
           setOutputTokens((n) => n + ev.completionTokens); // 累积输出 token
+          const ch = ev.cacheHitTokens, cm = ev.cacheMissTokens;
+          if (ch != null) setCacheHitTokens((n) => n + ch);
+          if (cm != null) setCacheMissTokens((n) => n + cm);
           setRequestCount((n) => n + 1); // 请求计数
         } else if (ev.type === "note") {
           push({ kind: "note", text: ev.text }); // 如「已折叠」提示
@@ -453,7 +570,7 @@ function App({ session }: { session: Session }) {
         setActiveTools(0);
       }
     },
-    [busy, exit, push, session]
+    [busy, exit, push, session, customCommands]
   );
 
   // 用 ref 让 stdin 监听器始终拿到最新的 input/busy/onSubmit（避免闭包过期）。
@@ -471,6 +588,8 @@ function App({ session }: { session: Session }) {
   pickerRef.current = picker;
   const switchRef = useRef(switchSession);
   switchRef.current = switchSession;
+  const customCommandsRef = useRef(customCommands);
+  customCommandsRef.current = customCommands;
 
   // 自己接管全部 stdin 解析（不再用 ink 的 useInput）——这样鼠标上报序列绝不会
   // 被当成「打字」塞进输入框。同时开启鼠标上报、统一处理滚轮 + 键盘。
@@ -576,12 +695,39 @@ function App({ session }: { session: Session }) {
       while (i < s.length) {
         const rest = s.slice(i);
         if (rest[0] === "\x1b") {
-          if (rest.startsWith("\x1b[A")) (histNav(-1), (i += 3)); // ↑
-          else if (rest.startsWith("\x1b[B")) (histNav(1), (i += 3)); // ↓
+          if (rest.startsWith("\x1b[A")) {
+            if (inp.includes("\n")) {
+              const { row, col } = cursorToRowCol(inp, cur);
+              cur = rowColToCursor(inp, row - 1, col);
+              touched = true;
+            } else histNav(-1);
+            i += 3;
+          } else if (rest.startsWith("\x1b[B")) {
+            if (inp.includes("\n")) {
+              const { row, col } = cursorToRowCol(inp, cur);
+              cur = rowColToCursor(inp, row + 1, col);
+              touched = true;
+            } else histNav(1);
+            i += 3;
+          }
           else if (rest.startsWith("\x1b[C")) ((cur = Math.min(inp.length, cur + 1)), (touched = true), (i += 3)); // →
           else if (rest.startsWith("\x1b[D")) ((cur = Math.max(0, cur - 1)), (touched = true), (i += 3)); // ←
-          else if (rest.startsWith("\x1b[H")) ((cur = 0), (touched = true), (i += 3)); // Home
-          else if (rest.startsWith("\x1b[F")) ((cur = inp.length), (touched = true), (i += 3)); // End
+          else if (rest.startsWith("\x1b[H")) {
+            if (inp.includes("\n")) {
+              const { row } = cursorToRowCol(inp, cur);
+              cur = rowColToCursor(inp, row, 0);
+            } else cur = 0;
+            touched = true;
+            i += 3;
+          } else if (rest.startsWith("\x1b[F")) {
+            if (inp.includes("\n")) {
+              const { row } = cursorToRowCol(inp, cur);
+              const { lines } = inputLineStarts(inp);
+              cur = rowColToCursor(inp, row, lines[row]!.length);
+            } else cur = inp.length;
+            touched = true;
+            i += 3;
+          }
           else {
             const m = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(rest);
             if (m) i += m[0].length; // 其它 CSI：跳过
@@ -596,7 +742,20 @@ function App({ session }: { session: Session }) {
         }
         const ch = rest[0]!;
         const code = ch.codePointAt(0)!;
-        if (ch === "\r" || ch === "\n") {
+        if (ch === "\r") {
+          if (inp.includes("\n")) {
+            // 多行输入：Enter 插入换行
+            inp = inp.slice(0, cur) + "\n" + inp.slice(cur);
+            cur += 1;
+          } else {
+            // 单行输入：Enter 提交（兼容既有行为）
+            submitRef.current(inp);
+            inp = "";
+            cur = 0;
+          }
+          touched = true;
+        } else if (ch === "\n") {
+          // Ctrl+J：始终提交（多行输入时用）
           submitRef.current(inp);
           inp = "";
           cur = 0;
@@ -610,7 +769,7 @@ function App({ session }: { session: Session }) {
         } else if (code === 9) {
           // Tab：补全斜杠命令（唯一匹配补全整条，多个补到公共前缀）
           if (inp.startsWith("/")) {
-            const customNames = customCommands.map((c) => `/${c.name}`);
+            const customNames = customCommandsRef.current.map((c) => `/${c.name}`);
             const allNames = [...customNames, ...COMMANDS.map((c) => c.name)];
             const names = allNames.filter((n) => n.startsWith(inp));
             if (names.length === 1) inp = names[0]!;
@@ -652,11 +811,17 @@ function App({ session }: { session: Session }) {
     : 0;
   const pickerVisible = picker ? picker.list.slice(pStart, pStart + PICK_MAX) : [];
   // 底部区域高度：确认框 / 选择器 / 输入框(+命令菜单)
+  // 输入框行数取 max(实际行数, 默认 10 行)，但不超过终端高度的 1/3
+  const inputLineCount = Math.max(1, input.split("\n").length);
+  const inputBoxRows = Math.min(
+    INPUT_MAX_ROWS,
+    Math.max(INPUT_MAX_ROWS, Math.min(inputLineCount, Math.floor(size.rows / 3)))
+  );
   const bottomRows = approval
     ? 2 + previewLines.length
     : picker
       ? 1 + pickerVisible.length
-      : 1 + menuRows;
+      : inputBoxRows + menuRows;
   const contentRows = Math.max(1, size.rows - 1 /*标题*/ - bottomRows);
 
   // spinner 旋转点（一圈 braille 点在转）。
@@ -679,6 +844,15 @@ function App({ session }: { session: Session }) {
   const end = allLines.length - off;
   const view = allLines.slice(Math.max(0, end - contentRows), end);
 
+  // 多行输入框：计算可见行范围（滑动窗口含光标行）
+  const { lines: allInputLines, starts: allInputStarts } = inputLineStarts(input);
+  const { row: cursorRow } = cursorToRowCol(input, cursor);
+  let startLine = Math.max(0, cursorRow - inputBoxRows + 1);
+  let endLine = Math.min(allInputLines.length, startLine + inputBoxRows);
+  startLine = Math.max(0, endLine - inputBoxRows);
+  if (allInputLines.length === 0) { startLine = 0; endLine = 0; }
+  const visibleInputLines = allInputLines.slice(startLine, endLine);
+
   return (
     <Box flexDirection="column" height={size.rows} width={size.cols}>
       {/* 顶部标题栏（固定）；显示 ctx 占比；上滚时显示提示 */}
@@ -692,14 +866,30 @@ function App({ session }: { session: Session }) {
         ) : null}
         {inputTokens > 0 ? (
           <Text dimColor>
-            {"  "}📥 {inputTokens >= 1000 ? `${(inputTokens / 1000).toFixed(1)}k` : inputTokens}
+            {"  "}↑{inputTokens >= 1000 ? `${(inputTokens / 1000).toFixed(1)}k` : inputTokens}
           </Text>
         ) : null}
         {outputTokens > 0 ? (
           <Text dimColor>
-            {"  "}📤 {outputTokens >= 1000 ? `${(outputTokens / 1000).toFixed(1)}k` : outputTokens}
+            {"  "}↓{outputTokens >= 1000 ? `${(outputTokens / 1000).toFixed(1)}k` : outputTokens}
           </Text>
         ) : null}
+        {cacheHitTokens > 0 ? (
+          <Text dimColor>
+            {"  "}🟢{cacheHitTokens >= 1000 ? `${(cacheHitTokens / 1000).toFixed(1)}k` : cacheHitTokens}
+          </Text>
+        ) : null}
+        {cacheMissTokens > 0 ? (
+          <Text dimColor>
+            {"  "}🔴{cacheMissTokens >= 1000 ? `${(cacheMissTokens / 1000).toFixed(1)}k` : cacheMissTokens}
+          </Text>
+        ) : null}
+        {(inputTokens > 0 || outputTokens > 0) ? (
+          <Text dimColor>
+            {"  "}💰 {calcPrice(config.model, cacheMissTokens, cacheHitTokens, outputTokens)}
+          </Text>
+        ) : null}
+        <Text dimColor> {peakLabel()}</Text>
         {ctxTokens > 0 ? (
           <Text dimColor>
             {"  "}ctx {Math.round((ctxTokens / config.compress.budget) * 100)}%
@@ -785,17 +975,51 @@ function App({ session }: { session: Session }) {
           {/* 命令菜单（仅在输入以 / 开头时） */}
           {!busy && inCmd ? <CommandMenu input={input} customCommands={customCommands} /> : null}
 
-          {/* 输入框：永远在最底部；光标块画在 cursor 位置（支持 ←→ 移动） */}
-          <Box>
-            <Text color="cyan">💬 {"> "}</Text>
-            <Text>{input.slice(0, cursor)}</Text>
-            {!busy ? (
-              <Text inverse>{input.slice(cursor, cursor + 1) || " "}</Text>
-            ) : null}
-            <Text>{input.slice(cursor + 1)}</Text>
-            {!input && !busy ? (
-              <Text dimColor>输入问题，/help 看命令，/exit 退出</Text>
-            ) : null}
+          {/* 多行输入框（默认 10 行）；光标支持 ←→↑↓ 移动 */}
+          {input.includes("\n") && !busy ? (
+            <Text dimColor>Ctrl+J 提交 · Enter 换行</Text>
+          ) : null}
+          <Box flexDirection="column">
+            {allInputLines.length === 0 ? (
+              <Box>
+                <Text color="cyan">💬 {"> "}</Text>
+                {!busy ? <Text inverse> </Text> : null}
+                {!busy ? (
+                  <Text dimColor> 输入问题，/help 看命令，/exit 退出</Text>
+                ) : null}
+              </Box>
+            ) : (
+              visibleInputLines.map((line, vi) => {
+                const actualRow = startLine + vi;
+                const isCursorLine = actualRow === cursorRow;
+                const cursorCol = isCursorLine ? cursor - allInputStarts[actualRow]! : -1;
+                return (
+                  <Box key={vi}>
+                    <Text color="cyan">
+                      {actualRow === 0 ? "💬 > " : "    "}
+                    </Text>
+                    {isCursorLine && !busy ? (
+                      <>
+                        <Text>{line.slice(0, cursorCol)}</Text>
+                        <Text inverse>{line.slice(cursorCol, cursorCol + 1) || " "}</Text>
+                        <Text>{line.slice(cursorCol + 1)}</Text>
+                      </>
+                    ) : (
+                      <Text dimColor={actualRow > 0}>{line || " "}</Text>
+                    )}
+                  </Box>
+                );
+              })
+            )}
+            {/* 填充到固定高度 */}
+            {Array.from(
+              { length: Math.max(0, inputBoxRows - visibleInputLines.length) },
+              (_, i) => (
+                <Box key={`fill-${i}`}>
+                  <Text> </Text>
+                </Box>
+              )
+            )}
           </Box>
         </>
       )}
