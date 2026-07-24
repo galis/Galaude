@@ -6,7 +6,6 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import { renderMemory, normalizeMemory } from "./memory.js";
-import { scanSkills, loadSkill, renderSkillList, renderSkillPrompts } from "./skill.js";
 import { loadGlobalMemory, saveGlobalMemory } from "./store.js";
 import type { AgentEvent } from "./agent.js";
 
@@ -148,61 +147,6 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           },
         },
         required: ["facts"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "skillread",
-      description:
-        "列出所有可用 skill（可命名的 system prompt 扩展片段）。" +
-        "返回 name + 一句话描述，不加载完整 prompt——渐进式披露，先看有哪些。",
-      parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "skillactivate",
-      description:
-        "激活指定 skill 列表（增量添加，已激活的不会被关闭）。" +
-        "激活后 skill 的 prompt 片段会每轮注入上下文，改变 agent 的行为模式。" +
-        "例如激活 review → agent 以「代码审查」模式工作；激活 commit → 按规范生成提交信息。" +
-        "可同时激活多个 skill（如 [\"code/review\", \"git/commit\"]），它们按序注入 prompt。" +
-        "关闭用 skilldeactivate。",
-      parameters: {
-        type: "object",
-        properties: {
-          skills: {
-            type: "array",
-            description: "要激活的 skill 名列表（全量替换），如 [\"review\", \"debug\"]",
-            items: { type: "string" },
-          },
-        },
-        required: ["skills"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "skilldeactivate",
-      description:
-        "关闭指定 skill 列表（从当前激活集中移除）。" +
-        "不影响其他已激活的 skill——激活是叠加的，关闭是逐一移除。",
-      parameters: {
-        type: "object",
-        properties: {
-          skills: {
-            type: "array",
-            description: "要关闭的 skill 名列表，如 [\"review\"]",
-            items: { type: "string" },
-          },
-        },
-        required: ["skills"],
         additionalProperties: false,
       },
     },
@@ -404,7 +348,6 @@ export const pureTools: Record<string, ToolImpl> = {
 // —— 有状态工具（todo）：拿到 ctx，可读写会话任务计划、发 UI 事件（见 D3）——
 export interface ToolCtx {
   plan: TodoPlan; // 会话任务计划，按引用传入（只暴露这一块 → 最小权限）
-  activeSkills: string[]; // 当前激活的 skill 名列表，按引用传入
   emit: (e: AgentEvent) => void;
   finishReason: string | null; // 本轮模型 finish_reason，用于截断自守（F1）
 }
@@ -434,58 +377,6 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
       renderMemory(r.facts) +
       (notes.length ? "\n（注：" + notes.join("；") + "）" : "")
     );
-  },
-
-  skillread(_args, _ctx) {
-    const list = scanSkills();
-    // 过滤掉 invocation=user 的（只能 /skill 手动触发，模型不可见）
-    const modelVisible = list.filter((s) => s.invocation !== "user");
-    return renderSkillList(modelVisible);
-  },
-
-  skillactivate({ skills }, ctx) {
-    if (!Array.isArray(skills)) throw new Error("skills 必须是数组");
-    const names: string[] = skills.filter((s): s is string => typeof s === "string" && s.trim().length > 0);
-    // 增量语义（并集）：新传入的 skill 加入激活集，已激活的保留
-    const added: string[] = [];
-    for (const name of names) {
-      if (ctx.activeSkills.includes(name)) continue;
-      // 校验存在
-      try { loadSkill(name); } catch (err) {
-        throw new Error(`skill ${name} 不存在（${err instanceof Error ? err.message : String(err)}）`);
-      }
-      ctx.activeSkills.push(name);
-      added.push(name);
-    }
-    if (added.length) {
-      ctx.emit({ type: "skills", skills: [...ctx.activeSkills] });
-      ctx.emit({ type: "note", text: `🎯 已激活 skill: ${added.join(", ")}` });
-    }
-    // 渲染当前全部激活 skill 的 prompt
-    const active = ctx.activeSkills.map((n) => loadSkill(n));
-    const prompts = renderSkillPrompts(active);
-    return ctx.activeSkills.length
-      ? `当前激活 ${ctx.activeSkills.length} 个 skill (${ctx.activeSkills.join(", ")}):\n${prompts.join("\n\n")}`
-      : "当前未激活任何 skill。";
-  },
-
-  skilldeactivate({ skills }, ctx) {
-    if (!Array.isArray(skills)) throw new Error("skills 必须是数组");
-    const removeSet = new Set(
-      skills.filter((s): s is string => typeof s === "string" && s.trim().length > 0)
-    );
-    const before = ctx.activeSkills.length;
-    const kept = ctx.activeSkills.filter((s) => !removeSet.has(s));
-    ctx.activeSkills.length = 0;
-    ctx.activeSkills.push(...kept);
-    const removed = before - ctx.activeSkills.length;
-    if (removed > 0) {
-      ctx.emit({ type: "skills", skills: [...ctx.activeSkills] });
-      ctx.emit({ type: "note", text: `🎯 已关闭 ${removed} 个 skill` });
-    }
-    return ctx.activeSkills.length
-      ? `已关闭指定 skill。当前激活：${ctx.activeSkills.join(", ")}`
-      : "已关闭，当前未激活任何 skill。";
   },
 
   todoread(_args, ctx) {

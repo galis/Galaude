@@ -51,7 +51,6 @@ export type AgentEvent =
   | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
   | { type: "note"; text: string } // 系统提示（如「已折叠」），界面当一条 note 显示
   | { type: "todos"; todos: Todo[] } // 任务清单变更，界面据此刷新面板
-  | { type: "skills"; skills: string[] } // skill 激活变更
   | { type: "debug"; text: string };
 export type Emitter = (ev: AgentEvent) => void;
 
@@ -280,8 +279,10 @@ export const SYSTEM_PROMPT =
   "（这三类文件操作一律用专门工具，不要用 run_bash 的 cat/echo/sed）；" +
   "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算；" +
   "todowrite/todoread 维护多步任务清单；" +
-  "memoryread/memorywrite 读写长期记忆（用户偏好、项目约定、关键决定等）；" +
-  "skillread/skillactivate/skilldeactivate 切换 skill 工作模式（渐进式披露：先 skillread 看有哪些，再 skillactivate 激活需要的）。" +
+  "memoryread/memorywrite 读写长期记忆（用户偏好、项目约定、关键决定等）。" +
+  "【Skill 规则】上下文中的「可用 Skills」列表常驻注入，展示每个 skill 的名+描述+文件路径。" +
+  "当你判断某个 skill 的描述与当前任务匹配时，用 read_file 读取对应 .md 文件加载完整提示，" +
+  "然后按照 skill 中的规范执行。不要凭空猜测 skill 的内容。" +
   "【任务清单规则】多步任务必须先用 todowrite 列出完整计划，再把第一项标为 in_progress 开始执行。" +
   "每做完一项立即用 todowrite 标 completed、把下一项标 in_progress，始终保持最多一个 in_progress。" +
   "开始执行前、不确定进度时先用 todoread 确认当前清单，不要凭记忆猜测。" +
@@ -305,7 +306,6 @@ export interface Session {
   memory: string[]; // 会话级外置关键事实（P3 自动抽取），豁免压缩
   globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json），每轮注入前读取
   plan: TodoPlan; // 任务清单（模型驱动，每轮回注上下文）
-  activeSkills: string[]; // 已激活的 skill 名列表（模型驱动，每轮回注上下文）
 }
 
 /** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
@@ -314,6 +314,8 @@ export function createSession(): Session {
   logger.section("工具定义 toolSchemas（随每轮一起发给模型）");
   logger.log(JSON.stringify(toolSchemas, null, 2));
   const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
+  // 首次启动：内置 skill 复制到用户目录（幂等，已有则跳过）
+  try { ensureUserSkills(); } catch { /* 非致命 */ }
   return {
     id: newSessionId(),
     createdAt: new Date().toISOString(),
@@ -325,10 +327,7 @@ export function createSession(): Session {
     summarizedUpTo: 0,
     memory: [],
     plan: emptyPlan(),
-    activeSkills: [],
   };
-  // 首次启动：内置 skill 复制到用户目录（幂等，已有则跳过）
-  try { ensureUserSkills(); } catch { /* 非致命 */ }
 }
 
 /**
@@ -349,7 +348,6 @@ export function adoptSession(target: Session, source: Session): void {
   target.summarizedUpTo = source.summarizedUpTo;
   target.memory = source.memory;
   target.plan = source.plan;
-  target.activeSkills = source.activeSkills;
 }
 
 /** 从存盘记录恢复一个会话：沿用其 id 与历史，重开一份运行日志。 */
@@ -369,7 +367,6 @@ export function resumeSession(stored: StoredSession): Session {
     summarizedUpTo: stored.summarizedUpTo ?? 0,
     memory: stored.memory ?? [],
     plan: stored.plan ?? emptyPlan(),
-    activeSkills: stored.activeSkills ?? [],
   };
 }
 
@@ -390,7 +387,6 @@ export function persist(session: Session): void {
     summarizedUpTo: session.summarizedUpTo,
     memory: session.memory,
     plan: session.plan,
-    activeSkills: session.activeSkills,
   });
 }
 
@@ -704,7 +700,7 @@ export async function runAgent(
 
     // 阶段 3：并行执行（只跑还没定结果的；各自 try/catch；完成即 emit，乱序但带名字）
     // 分派：有状态工具（todo）走 statefulTools（同步、带 ctx）；其余走 pureTools（可异步）。
-    const toolCtx: ToolCtx = { plan: session.plan, activeSkills: session.activeSkills, emit, finishReason: finishReason ?? null };
+    const toolCtx: ToolCtx = { plan: session.plan, emit, finishReason: finishReason ?? null };
     await Promise.all(
       toolCalls.map(async (call, i) => {
         const name = call.function.name;

@@ -22,9 +22,7 @@ import { type Todo } from "./todo.js";
 import { renderMemory } from "./memory.js";
 import {
   scanSkills,
-  loadSkill,
   renderSkillList,
-  renderSkillPrompts,
 } from "./skill.js";
 import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
@@ -44,7 +42,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/context", desc: "显示当前上下文占用情况" },
   { name: "/todo", desc: "显示当前任务清单（只读；增删让 agent 代劳）" },
   { name: "/memory", desc: "显示当前长期记忆（只读；增删让 agent 代劳）" },
-  { name: "/skill", desc: "skill 管理：/skill list 列出 | /skill <name> 激活 | /skill off <name> 关闭 | /skill off 全关" },
+  { name: "/skill", desc: "skill 管理：/skill list 列出所有（名+描述+文件路径），需要时用 read_file 读取" },
   { name: "/mode", desc: "切换确认模式 auto（判风险才确认）/ strict（一律确认）" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
@@ -193,7 +191,6 @@ function App({ session }: { session: Session }) {
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
-  const [activeSkills, setActiveSkills] = useState<string[]>(() => session.activeSkills);
   const [tick, setTick] = useState(0); // 驱动 spinner 动画的帧计数
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
@@ -222,7 +219,6 @@ function App({ session }: { session: Session }) {
       setPicker(null);
       setCtxTokens(ns.lastPromptTokens); // ctx 占比切到目标会话
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
-      setActiveSkills([...ns.activeSkills]); // 面板切到目标会话的 skill
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
       setItems([
@@ -330,44 +326,8 @@ function App({ session }: { session: Session }) {
         return push({ kind: "memory", text: renderMemory(merged) });
       }
       if (text.startsWith("/skill")) {
-        const arg = text.slice(6).trim();
-        if (!arg || arg === "list") {
-          const list = scanSkills();
-          return push({ kind: "skill", text: renderSkillList(list) });
-        }
-        if (arg === "off") {
-          session.activeSkills.length = 0;
-          setActiveSkills([...session.activeSkills]);
-          return push({ kind: "skill", text: "🎯 已关闭所有 skill" });
-        }
-        if (arg.startsWith("off ")) {
-          const toRemove = arg.slice(4).trim().split(/\s+/).filter(Boolean);
-          const kept = session.activeSkills.filter((s) => !toRemove.includes(s));
-          session.activeSkills.length = 0;
-          session.activeSkills.push(...kept);
-          setActiveSkills([...session.activeSkills]);
-          return push({ kind: "skill", text: `🎯 已关闭: ${toRemove.join(", ")}，当前激活: ${kept.length ? kept.join(", ") : "（无）"}` });
-        }
-        // 激活：/skill name1 name2 ...（增量，已激活的不影响）
-        const names = arg.split(/\s+/).filter(Boolean);
-        const added: string[] = [];
-        for (const n of names) {
-          if (session.activeSkills.includes(n)) continue;
-          try {
-            loadSkill(n);
-            session.activeSkills.push(n);
-            added.push(n);
-          } catch (err) {
-            return push({ kind: "note", text: `❓ skill ${n} 不存在（${err instanceof Error ? err.message : String(err)}）` });
-          }
-        }
-        setActiveSkills([...session.activeSkills]);
-        if (added.length) {
-          const active = session.activeSkills.map((n) => loadSkill(n));
-          const prompts = renderSkillPrompts(active);
-          return push({ kind: "skill", text: `🎯 已激活 skill: ${added.join(", ")}${"\n" + prompts.join("\n\n")}` });
-        }
-        return push({ kind: "skill", text: `当前激活: ${session.activeSkills.length ? session.activeSkills.join(", ") : "（无）"}` });
+        const list = scanSkills();
+        return push({ kind: "skill", text: renderSkillList(list) });
       }
       if (text === "/mode" || text.startsWith("/mode ")) {
         const arg = text.slice(5).trim();
@@ -414,8 +374,6 @@ function App({ session }: { session: Session }) {
         } else if (ev.type === "todos") {
           setTodos(ev.todos); // 刷新标题栏常驻的 📋 done/total
           push({ kind: "todos", todos: ev.todos }); // 详情变化时印入流
-        } else if (ev.type === "skills") {
-          setActiveSkills([...ev.skills]);
         }
       };
       // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。

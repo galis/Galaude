@@ -75,7 +75,6 @@ export const GraphState = Annotation.Root({
   summarizedUpTo: Annotation<number>({ reducer: (_, b) => b, default: () => 0 }),
   memory: Annotation<string[]>({ reducer: (_, b) => b, default: () => [] }),
   plan: Annotation<TodoPlan>({ reducer: (_, b) => b, default: emptyPlan }),
-  activeSkills: Annotation<string[]>({ reducer: (_, b) => b, default: () => [] }),
   // judge 节点的产物：需要确认的 tool_call（id + 风险理由 + 用户批复）。
   // 放进 state（而不是节点局部变量）是刻意的：approve 节点里的 interrupt 恢复时
   // 会【从节点开头重放】，判风险的 LLM 调用若和 interrupt 同节点就会被反复重跑；
@@ -280,7 +279,6 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
     globalMemory: loadGlobalMemory(),
     lastPromptTokens: state.lastPromptTokens,
     plan: state.plan,
-    activeSkills: state.activeSkills,
   });
   logger.section(
     `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${state.messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${state.lastPromptTokens} tok）`
@@ -438,7 +436,7 @@ async function toolsNode(state: GState, cfg: LangGraphRunnableConfig) {
   const finishReason =
     ((ai?.response_metadata as { finish_reason?: string } | undefined)?.finish_reason ??
       null);
-  const toolCtx: ToolCtx = { plan: scratchPlan, activeSkills: state.activeSkills, emit, finishReason };
+  const toolCtx: ToolCtx = { plan: scratchPlan, emit, finishReason };
 
   // 阶段 3：并行执行（被拒的用占位结果；各自 try/catch；完成即 emit）
   const results = await Promise.all(

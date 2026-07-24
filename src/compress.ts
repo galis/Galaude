@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderMemory } from "./memory.js";
 import { renderTodos, type TodoPlan } from "./todo.js";
-import { loadSkill, renderSkillPrompts, scanSkills, renderSkillHint, type Skill } from "./skill.js";
+import { scanSkills, renderSkillIndex } from "./skill.js";
 
 type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -80,7 +80,6 @@ export interface CompressState<M = OAIMessage> {
   globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json，跨会话共享）
   lastPromptTokens: number;
   plan?: TodoPlan; // 任务清单（豁免压缩、每轮回注）
-  activeSkills?: string[]; // 已激活的 skill 名列表
 }
 
 // ———————————————————— 层 A：裁旧工具输出 ————————————————————
@@ -136,23 +135,12 @@ const todoText = (plan: TodoPlan) =>
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
  */
 export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[] {
-  const { messages, summaries, summarizedUpTo: k, memory, globalMemory, lastPromptTokens, plan, activeSkills } = s;
+  const { messages, summaries, summarizedUpTo: k, memory, globalMemory, lastPromptTokens, plan } = s;
   const system = messages[0];
   const ctx: M[] = system ? [system] : [];
-  // 发现层：始终注入可用 skill 列表（让模型不调 skillread 也知道有哪些）
-  const all = scanSkills();
-  if (all.length) ctx.push(ops.system(renderSkillHint(all)));
-  // 激活的 skill prompts（发现层之后）
-  if (activeSkills?.length) {
-    const skills: Skill[] = [];
-    for (const name of activeSkills) {
-      try { skills.push(loadSkill(name)); } catch { /* 文件被删了，跳过 */ }
-    }
-    if (skills.length) {
-      const prompts = renderSkillPrompts(skills);
-      for (const p of prompts) ctx.push(ops.system(p));
-    }
-  }
+  // Skill 第一层（常驻注入）：name + description，模型判断匹配后用 read_file 自行读取
+  const skills = scanSkills();
+  if (skills.length) ctx.push(ops.system(renderSkillIndex(skills)));
   // 合并全局 + 会话级记忆，全局在前
   const merged = [...(globalMemory ?? []), ...memory];
   if (merged.length) ctx.push(ops.system(renderMemory(merged)));
