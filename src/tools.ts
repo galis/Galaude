@@ -195,6 +195,88 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "batch_read_file",
+      description:
+        "一次读取多个文本文件内容（每个文件带行号返回）。" +
+        "需要同时查看多个文件时优先使用，避免多次调用 read_file。" +
+        "每个文件最多返回 400 行，超大文件会截断并标注。",
+      parameters: {
+        type: "object",
+        properties: {
+          paths: {
+            type: "array",
+            description: "要读取的文件路径列表（相对或绝对）",
+            items: { type: "string" },
+          },
+        },
+        required: ["paths"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "batch_write_file",
+      description:
+        "一次写入/覆盖多个文件（父目录须已存在；文件不存在则新建）。" +
+        "需要同时创建或覆盖多个文件时优先使用，避免多次调用 write_file。",
+      parameters: {
+        type: "object",
+        properties: {
+          files: {
+            type: "array",
+            description: "要写入的文件列表",
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "文件路径" },
+                content: { type: "string", description: "要写入的完整内容" },
+              },
+              required: ["path", "content"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["files"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "batch_edit_file",
+      description:
+        "一次对多个文件做精确编辑：每个编辑中 old_string 在对应文件中「唯一一次」出现替换成 new_string。" +
+        "old_string 必须逐字匹配（含缩进与换行），且在文件中唯一。" +
+        "需要同时修改多个文件时优先使用，避免多次调用 edit_file。",
+      parameters: {
+        type: "object",
+        properties: {
+          edits: {
+            type: "array",
+            description: "要执行的编辑列表",
+            items: {
+              type: "object",
+              properties: {
+                path: { type: "string", description: "文件路径" },
+                old_string: { type: "string", description: "要被替换的原文（需唯一）" },
+                new_string: { type: "string", description: "替换成的新内容" },
+              },
+              required: ["path", "old_string", "new_string"],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ["edits"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 // 需要先经用户确认才执行的「危险」工具（有副作用 / 能跑任意命令）。
@@ -203,6 +285,8 @@ export const needsApproval = new Set<string>([
   "run_bash",
   "write_file",
   "edit_file",
+  "batch_write_file",
+  "batch_edit_file",
 ]);
 
 // —— 确定性风险规则（auto 模式的第一道闸）——
@@ -239,6 +323,28 @@ export function ruleRisk(
     const cwd = process.cwd();
     if (p !== cwd && !p.startsWith(cwd + sep))
       return `写工作目录（${cwd}）之外的路径`;
+    return null;
+  }
+  if (name === "batch_write_file") {
+    const files = args.files as { path?: string }[] | undefined;
+    if (!Array.isArray(files)) return null;
+    const cwd = process.cwd();
+    for (const f of files) {
+      const p = resolve(String(f.path ?? ""));
+      if (p !== cwd && !p.startsWith(cwd + sep))
+        return `批量写入含工作目录（${cwd}）之外的路径: ${f.path}`;
+    }
+    return null;
+  }
+  if (name === "batch_edit_file") {
+    const edits = args.edits as { path?: string }[] | undefined;
+    if (!Array.isArray(edits)) return null;
+    const cwd = process.cwd();
+    for (const e of edits) {
+      const p = resolve(String(e.path ?? ""));
+      if (p !== cwd && !p.startsWith(cwd + sep))
+        return `批量编辑含工作目录（${cwd}）之外的路径: ${e.path}`;
+    }
     return null;
   }
   return null;
@@ -342,6 +448,78 @@ export const pureTools: Record<string, ToolImpl> = {
       throw new Error("old_string 在文件中出现多次，请提供更长、唯一的片段");
     await writeFile(p, content.slice(0, idx) + newS + content.slice(idx + oldS.length), "utf8");
     return `已编辑 ${p}（替换 1 处）`;
+  },
+
+  async batch_read_file({ paths }) {
+    const arr = paths as string[] | undefined;
+    if (!Array.isArray(arr) || arr.length === 0)
+      throw new Error("paths 为空或不是数组");
+    const results: string[] = [];
+    for (const raw of arr) {
+      const p = String(raw ?? "").trim();
+      if (!p) { results.push(`⚠️ 跳过空路径`); continue; }
+      try {
+        const content = await readFile(p, "utf8");
+        const lines = content.split("\n");
+        const shown = lines.slice(0, 400);
+        const body = shown.map((l, i) => `${i + 1}\t${l}`).join("\n");
+        const more = lines.length > shown.length ? `\n…(共 ${lines.length} 行，省略其余)` : "";
+        results.push(`=== ${p} ===\n${body + more || "(空文件)"}`);
+      } catch (e) {
+        results.push(`=== ${p} ===\n❌ 读取失败: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    return results.join("\n\n");
+  },
+
+  async batch_write_file({ files }) {
+    const arr = files as { path?: string; content?: string }[] | undefined;
+    if (!Array.isArray(arr) || arr.length === 0)
+      throw new Error("files 为空或不是数组");
+    const results: string[] = [];
+    for (const f of arr) {
+      const p = String(f.path ?? "").trim();
+      if (!p) { results.push("⚠️ 跳过空路径"); continue; }
+      const c = String(f.content ?? "");
+      await writeFile(p, c, "utf8");
+      results.push(`已写入 ${p}（${c.split("\n").length} 行，${Buffer.byteLength(c)} 字节）`);
+    }
+    return results.join("\n");
+  },
+
+  async batch_edit_file({ edits }) {
+    const arr = edits as { path?: string; old_string?: string; new_string?: string }[] | undefined;
+    if (!Array.isArray(arr) || arr.length === 0)
+      throw new Error("edits 为空或不是数组");
+
+    // 预校验：先通读所有文件、检查 old_string 是否能匹配，全部通过后再落盘
+    const plans: { path: string; idx: number; oldS: string; newS: string; content: string }[] = [];
+    for (const e of arr) {
+      const p = String(e.path ?? "").trim();
+      if (!p) throw new Error("edits 中含有空路径");
+      const oldS = String(e.old_string ?? "");
+      const newS = String(e.new_string ?? "");
+      if (!oldS) throw new Error(`编辑 ${p} 时 old_string 为空`);
+      const content = await readFile(p, "utf8");
+      const idx = content.indexOf(oldS);
+      if (idx === -1)
+        throw new Error(`文件中找不到 old_string（需逐字匹配，含缩进/换行）: ${p}`);
+      if (content.indexOf(oldS, idx + 1) !== -1)
+        throw new Error(`old_string 在文件中出现多次，请提供更长、唯一的片段: ${p}`);
+      plans.push({ path: p, idx, oldS, newS, content });
+    }
+
+    // 全部预校验通过，开始写入
+    const results: string[] = [];
+    for (const plan of plans) {
+      await writeFile(
+        plan.path,
+        plan.content.slice(0, plan.idx) + plan.newS + plan.content.slice(plan.idx + plan.oldS.length),
+        "utf8"
+      );
+      results.push(`已编辑 ${plan.path}（替换 1 处）`);
+    }
+    return results.join("\n");
   },
 };
 
@@ -478,6 +656,51 @@ export async function describeForApproval(
       warn = "\n⚠️ 读不到该文件（执行会失败）";
     }
     return `编辑 ${p}${warn}\n${lineDiff(oldS, newS)}`;
+  }
+
+  if (name === "batch_read_file") {
+    const paths = args.paths as string[] | undefined;
+    if (!Array.isArray(paths) || paths.length === 0) return "batch_read_file（空列表）";
+    return `批量读取 ${paths.length} 个文件:\n${paths.map((p, i) => `  ${i + 1}. ${String(p ?? "")}`).join("\n")}`;
+  }
+
+  if (name === "batch_write_file") {
+    const files = args.files as { path?: string; content?: string }[] | undefined;
+    if (!Array.isArray(files) || files.length === 0) return "batch_write_file（空列表）";
+    const lines = files.map((f, i) => {
+      const p = String(f.path ?? "");
+      const c = String(f.content ?? "");
+      const preview = c.length > 200 ? c.slice(0, 200) + "\n…(内容截断)" : c;
+      return `  ${i + 1}. ${p}（${c.split("\n").length} 行，${Buffer.byteLength(c)} 字节）\n${lineDiff("", preview)}`;
+    });
+    if (lines.length > 6) {
+      return `批量写入 ${files.length} 个文件:\n${lines.slice(0, 5).join("\n")}\n…(共 ${files.length} 个文件，省略其余)`;
+    }
+    return `批量写入 ${files.length} 个文件:\n${lines.join("\n")}`;
+  }
+
+  if (name === "batch_edit_file") {
+    const edits = args.edits as { path?: string; old_string?: string; new_string?: string }[] | undefined;
+    if (!Array.isArray(edits) || edits.length === 0) return "batch_edit_file（空列表）";
+    const lines: string[] = [];
+    for (const e of edits) {
+      const p = String(e.path ?? "");
+      const oldS = String(e.old_string ?? "");
+      const newS = String(e.new_string ?? "");
+      let warn = "";
+      try {
+        const content = await readFile(p, "utf8");
+        if (!content.includes(oldS)) warn = " ⚠️ 未找到匹配";
+      } catch {
+        warn = " ⚠️ 读不到该文件";
+      }
+      const diff = lineDiff(oldS, newS);
+      lines.push(`${p}${warn}\n${diff}`);
+    }
+    if (lines.length > 6) {
+      return `批量编辑 ${edits.length} 个文件:\n${lines.slice(0, 5).join("\n---\n")}\n…(共 ${edits.length} 个文件，省略其余)`;
+    }
+    return `批量编辑 ${edits.length} 个文件:\n${lines.join("\n---\n")}`;
   }
 
   return `${name}(${JSON.stringify(args)})`;
