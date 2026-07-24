@@ -1,5 +1,6 @@
 ---
 description: Git 提交：查看变更、生成规范的 commit message、commit 并 push
+invocation: both
 ---
 
 你处于「Git 提交」模式。提交代码时遵循：

@@ -107,9 +107,10 @@ describe("applyCompaction / buildContext", () => {
     const ctx = buildContext(s);
     expect(s.messages).toHaveLength(messages.length); // 真相源没被删
     expect(ctx[0]).toBe(s.messages[0]); // system 原样在最前（缓存根）
-    expect(String(ctx[1]!.content)).toContain("第一轮摘要");
-    expect(ctx).toHaveLength(1 + 1 + 6); // system + 摘要 + 近段 [3..8]
-    expect(ctx[2]).toEqual(user("u2")); // 近段从水位线后第一条（轮边界 user）开始
+    // ctx[1] = skill hint（buildContext 始终注入），ctx[2] = 摘要
+    expect(String(ctx[2]!.content)).toContain("第一轮摘要");
+    expect(ctx).toHaveLength(1 + 1 + 1 + 6); // system + skill hint + 摘要 + 近段 [3..8]
+    expect(ctx[3]).toEqual(user("u2")); // 近段从水位线后第一条（轮边界 user）开始
   });
 
   it("外置记忆豁免压缩、排在摘要前", () => {
@@ -120,8 +121,9 @@ describe("applyCompaction / buildContext", () => {
       summarizedUpTo: 0,
     });
     const ctx = buildContext(s);
-    expect(String(ctx[1]!.content)).toContain("用户偏好中文回答");
-    expect(String(ctx[2]!.content)).toContain("s1-2");
+    // ctx[0]=system, ctx[1]=skill hint, ctx[2]=memory, ctx[3]=summary
+    expect(String(ctx[2]!.content)).toContain("用户偏好中文回答");
+    expect(String(ctx[3]!.content)).toContain("s1-2");
   });
 });
 
@@ -157,10 +159,11 @@ describe("LC 方言（LangGraph 引擎走同一套压缩逻辑）", () => {
     const ctx = buildContextWith(lcOps, s);
     expect(s.messages).toHaveLength(9);
     expect(ctx[0]).toBe(s.messages[0]);
-    expect(String(ctx[1]!.content)).toContain("用户偏好中文回答"); // 记忆在摘要前
-    expect(String(ctx[2]!.content)).toContain("第一轮摘要");
-    expect(ctx).toHaveLength(1 + 2 + 6); // system + 记忆/摘要 + 近段 [3..8]
-    expect(String(ctx[3]!.content)).toBe("u2"); // 近段从轮边界(user)开始
+    // ctx[0]=system, ctx[1]=skill hint, ctx[2]=memory, ctx[3]=summary, ctx[4..9]=近段
+    expect(String(ctx[2]!.content)).toContain("用户偏好中文回答"); // 记忆在摘要前
+    expect(String(ctx[3]!.content)).toContain("第一轮摘要");
+    expect(ctx).toHaveLength(1 + 1 + 2 + 6); // system + skill hint + 记忆/摘要 + 近段 [3..8]
+    expect(String(ctx[4]!.content)).toBe("u2"); // 近段从轮边界(user)开始
   });
 });
 

@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderMemory } from "./memory.js";
 import { renderTodos, type TodoPlan } from "./todo.js";
-import { loadSkill, renderSkillPrompts, type Skill } from "./skill.js";
+import { loadSkill, renderSkillPrompts, scanSkills, renderSkillHint, type Skill } from "./skill.js";
 
 type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -139,7 +139,10 @@ export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[
   const { messages, summaries, summarizedUpTo: k, memory, globalMemory, lastPromptTokens, plan, activeSkills } = s;
   const system = messages[0];
   const ctx: M[] = system ? [system] : [];
-  // 激活的 skill prompts（system root 之后，记忆之前）
+  // 发现层：始终注入可用 skill 列表（让模型不调 skillread 也知道有哪些）
+  const all = scanSkills();
+  if (all.length) ctx.push(ops.system(renderSkillHint(all)));
+  // 激活的 skill prompts（发现层之后）
   if (activeSkills?.length) {
     const skills: Skill[] = [];
     for (const name of activeSkills) {

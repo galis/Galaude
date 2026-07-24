@@ -46,20 +46,20 @@ describe("scanSkills", () => {
   it("扫描内置目录中的扁平 skill", () => {
     makeSkill(builtinDir, "review", "代码审查", "审查代码。");
     const r = scanSkills(userDir, builtinDir);
-    expect(r).toEqual([{ name: "review", description: "代码审查" }]);
+    expect(r).toEqual([{ name: "review", description: "代码审查", invocation: "both" }]);
   });
 
   it("扫描子目录 skill（目录即分类）", () => {
     makeSkill(builtinDir, "code/debug", "调试排错", "调试模式。");
     const r = scanSkills(userDir, builtinDir);
-    expect(r).toEqual([{ name: "code/debug", description: "调试排错" }]);
+    expect(r).toEqual([{ name: "code/debug", description: "调试排错", invocation: "both" }]);
   });
 
   it("用户目录覆盖内置同名 skill", () => {
     makeSkill(builtinDir, "review", "内置审查", "builtin body");
     makeSkill(userDir, "review", "用户审查", "user body");
     const r = scanSkills(userDir, builtinDir);
-    expect(r).toEqual([{ name: "review", description: "用户审查" }]);
+    expect(r).toEqual([{ name: "review", description: "用户审查", invocation: "both" }]);
   });
 
   it("多 skill 按名字排序", () => {
@@ -77,6 +77,7 @@ describe("loadSkill", () => {
     const s = loadSkill("review", userDir, builtinDir);
     expect(s.name).toBe("review");
     expect(s.description).toBe("审查代码");
+    expect(s.invocation).toBe("both");
     expect(s.prompt).toBe("请仔细审查。\n- 检查 bug\n- 检查性能");
   });
 
@@ -97,6 +98,7 @@ describe("loadSkill", () => {
     writeFileSync(p, "就是一段纯文本");
     const s = loadSkill("plain", userDir, builtinDir);
     expect(s.description).toBe("(无描述)");
+    expect(s.invocation).toBe("both");
     expect(s.prompt).toBe("就是一段纯文本");
   });
 });
@@ -108,8 +110,8 @@ describe("renderSkillList", () => {
 
   it("展示名 + 描述", () => {
     const list: SkillMeta[] = [
-      { name: "review", description: "审查代码" },
-      { name: "debug", description: "调试" },
+      { name: "review", description: "审查代码", invocation: "both" },
+      { name: "debug", description: "调试", invocation: "both" },
     ];
     const s = renderSkillList(list);
     expect(s).toContain("review");
@@ -122,7 +124,7 @@ describe("renderSkillList", () => {
 describe("renderSkillPrompts", () => {
   it("展开为 system 消息内容数组", () => {
     const prompts = renderSkillPrompts([
-      { name: "review", description: "d", prompt: "审查原则:\n1. ux\n2. perf" },
+      { name: "review", description: "d", invocation: "both", prompt: "审查原则:\n1. ux\n2. perf" },
     ]);
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toContain("【已激活 Skill: review】");
@@ -132,8 +134,8 @@ describe("renderSkillPrompts", () => {
 
   it("多个 skill 各一条", () => {
     const prompts = renderSkillPrompts([
-      { name: "a", description: "", prompt: "A" },
-      { name: "b", description: "", prompt: "B" },
+      { name: "a", description: "", invocation: "both", prompt: "A" },
+      { name: "b", description: "", invocation: "both", prompt: "B" },
     ]);
     expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain("A");

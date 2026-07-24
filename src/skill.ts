@@ -14,6 +14,7 @@ import { join, relative, dirname } from "node:path";
 export interface SkillMeta {
   name: string;       // 如 "review"、"code/debug"
   description: string; // 一行话
+  invocation: "model" | "user" | "both"; // 触发方式
 }
 
 /** 一条完整的 skill（激活后缓存用）。 */
@@ -98,7 +99,7 @@ export function scanSkills(
   for (const name of [...map.keys()].sort()) {
     try {
       const skill = loadSkill(name, u, b);
-      result.push({ name: skill.name, description: skill.description });
+      result.push({ name: skill.name, description: skill.description, invocation: skill.invocation });
     } catch {
       // 文件损坏，跳过
     }
@@ -116,9 +117,11 @@ function parseFrontmatter(raw: string): { meta: Record<string, string>; body: st
   const body = lines.slice(end + 2).join("\n").trim();
   const meta: Record<string, string> = {};
   for (const line of fmLines) {
-    const m = line.match(/^(\w+):\s*(.*)/);
+    const m = line.match(/^(\w[\w-]*):\s*(.*)/);
     if (m) meta[m[1]!] = (m[2] ?? "").trim();
   }
+  // 向后兼容：tools 别名 → allowed-tools
+  if (meta["tools"] && !meta["allowed-tools"]) meta["allowed-tools"] = meta["tools"];
   return { meta, body };
 }
 
@@ -143,8 +146,10 @@ export function loadSkill(
   const { meta, body } = parseFrontmatter(raw);
   const description = meta.description || "(无描述)";
   const prompt = body || description;
+  const invocation = meta.invocation === "model" || meta.invocation === "user"
+    ? meta.invocation : "both";
 
-  return { name, description, prompt };
+  return { name, description, invocation, prompt };
 }
 
 // ——————————————————— 渲染 ———————————————————
@@ -157,4 +162,27 @@ export function renderSkillList(skills: SkillMeta[]): string {
 /** 把已激活 skill 的 prompt 展开成 system 消息内容列表（每条一个 skill）。 */
 export function renderSkillPrompts(skills: Skill[]): string[] {
   return skills.map((s) => `【已激活 Skill: ${s.name}】\n${s.prompt}`);
+}
+
+/**
+ * 发现层始终注入：一行提示列出所有 skill 名（不含激活的 prompt）。
+ * 极轻量（~20 token/skill），让模型无需调用 skillread 也知道有哪些可用。
+ */
+export function renderSkillHint(skills: SkillMeta[]): string {
+  if (!skills.length) return "";
+  const names = skills.map((s) => s.name).join(", ");
+  return `【可用 Skills】${names} | 用 skillactivate <name> 激活 | skillread 查看详情`;
+}
+
+/**
+ * 获取 skill 的参考文件目录路径。
+ * 如 skill "code/review"，返回 skill 文件所在目录，
+ * body 中可引用相对路径如 `./references/forms.md`。
+ */
+export function getSkillDir(name: string): string {
+  const userFile = join(getUserSkillsDir(), `${name}.md`);
+  const builtinFile = join(getBuiltinSkillsDir(), `${name}.md`);
+  try { readFileSync(userFile); return dirname(userFile); } catch { /* skip */ }
+  try { readFileSync(builtinFile); return dirname(builtinFile); } catch { /* skip */ }
+  return dirname(builtinFile); // 回退
 }

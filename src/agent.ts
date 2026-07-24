@@ -281,7 +281,7 @@ export const SYSTEM_PROMPT =
   "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算；" +
   "todowrite/todoread 维护多步任务清单；" +
   "memoryread/memorywrite 读写长期记忆（用户偏好、项目约定、关键决定等）；" +
-  "skillread/skillactivate 切换 skill 工作模式（渐进式披露：先 skillread 看有哪些，再 skillactivate 激活需要的）。" +
+  "skillread/skillactivate/skilldeactivate 切换 skill 工作模式（渐进式披露：先 skillread 看有哪些，再 skillactivate 激活需要的）。" +
   "【任务清单规则】多步任务必须先用 todowrite 列出完整计划，再把第一项标为 in_progress 开始执行。" +
   "每做完一项立即用 todowrite 标 completed、把下一项标 in_progress，始终保持最多一个 in_progress。" +
   "开始执行前、不确定进度时先用 todoread 确认当前清单，不要凭记忆猜测。" +
