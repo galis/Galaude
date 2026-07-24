@@ -18,7 +18,7 @@ import {
   parseRisk,
   parseSummary,
 } from "./llmtasks.js";
-import { newSessionId, saveSession, type StoredSession } from "./store.js";
+import { newSessionId, saveSession, loadGlobalMemory, type StoredSession } from "./store.js";
 import { emptyPlan, type Todo, type TodoPlan } from "./todo.js";
 import {
   buildContext,
@@ -277,10 +277,16 @@ export const SYSTEM_PROMPT =
   "read_file 读文件、write_file 写/建文件、edit_file 精确改文件" +
   "（这三类文件操作一律用专门工具，不要用 run_bash 的 cat/echo/sed）；" +
   "run_bash 跑其它命令（构建、测试、git、看目录等）；calculate 做精确计算；" +
-  "todowrite/todoread 维护多步任务清单。" +
-  "优先用工具获取真实信息，不要凭空臆测或编造文件内容；" +
-  "遇到多步任务，先用 todowrite 列出计划，每完成一步就更新状态（同一时刻最多一个 in_progress），" +
-  "让你和用户都能追踪进度；完成后用简洁清晰的话回答。";
+  "todowrite/todoread 维护多步任务清单；" +
+  "memoryread/memorywrite 读写长期记忆（用户偏好、项目约定、关键决定等）。" +
+  "【任务清单规则】多步任务必须先用 todowrite 列出完整计划，再把第一项标为 in_progress 开始执行。" +
+  "每做完一项立即用 todowrite 标 completed、把下一项标 in_progress，始终保持最多一个 in_progress。" +
+  "开始执行前、不确定进度时先用 todoread 确认当前清单，不要凭记忆猜测。" +
+  "清单会每轮自动回注到上下文，你始终看得见——照着清单推进，不要跳过 todowrite 直接干活。" +
+  "【记忆规则】用户说了值得长期记住的事（偏好、约定、决定、身份信息、项目规则），用 memorywrite 记下来；" +
+  "开始新任务前先用 memoryread 了解背景。记忆是跨会话持久化的，不要记琐碎/临时信息。" +
+  "【通用规则】优先用工具获取真实信息，不要凭空臆测或编造文件内容；" +
+  "完成后用简洁清晰的话回答。";
 
 /** 一次对话会话：跨多轮用户输入持久保存历史与日志。 */
 export interface Session {
@@ -293,7 +299,8 @@ export interface Session {
   // —— 压缩状态（投影用，messages 始终完整不动）——
   summaries: SummarySegment[]; // 旧段摘要，append-only
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
-  memory: string[]; // 外置关键事实，豁免压缩（P3 自动抽取；现可手动用）
+  memory: string[]; // 会话级外置关键事实（P3 自动抽取），豁免压缩
+  globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json），每轮注入前读取
   plan: TodoPlan; // 任务清单（模型驱动，每轮回注上下文）
 }
 
@@ -539,6 +546,9 @@ export async function runAgent(
   logger.section(`========== 用户输入 #${session.round} ==========`);
   logger.log(userInput);
   persist(session); // 先记下用户这轮（即使中途被中断也不丢）
+
+  // 每轮注入前刷新全局记忆（跨会话共享 → 新会话也能看到之前记下的事实）
+  session.globalMemory = loadGlobalMemory();
 
   // 轮边界：上下文偏大就先把最旧的若干完整轮折叠成摘要，再开始这一轮（不折当前在飞轮）。
   await maybeCompact(session, emit, signal);

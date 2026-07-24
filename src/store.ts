@@ -5,6 +5,7 @@ import {
   renameSync,
   writeFileSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type OpenAI from "openai";
 import type { SummarySegment } from "./compress.js";
@@ -130,4 +131,32 @@ export function loadSession(idOrPrefix: string): StoredSession | null {
 export function latestSession(): StoredSession | null {
   const m = readIndex()[0];
   return m ? loadSession(m.id) : null;
+}
+
+// —— 全局长期记忆（~/.galaude/memory.json），跨会话共享 ——
+
+const GLOBAL_DIR = join(homedir(), ".galaude");
+const GLOBAL_MEMORY = join(GLOBAL_DIR, "memory.json");
+
+function atomicWriteGlobal(target: string, data: string): void {
+  mkdirSync(GLOBAL_DIR, { recursive: true });
+  const tmp = `${target}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, target);
+}
+
+/** 加载全局长期记忆（跨会话共享的用户偏好、项目约定等）。文件不存在返回 []。 */
+export function loadGlobalMemory(): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(GLOBAL_MEMORY, "utf8"));
+    if (Array.isArray(raw)) return raw.filter((x): x is string => typeof x === "string");
+  } catch {
+    /* 文件不存在或损坏 */
+  }
+  return [];
+}
+
+/** 保存全局长期记忆（原子 temp+rename，同会话落盘机制）。 */
+export function saveGlobalMemory(facts: string[]): void {
+  atomicWriteGlobal(GLOBAL_MEMORY, JSON.stringify(facts, null, 2));
 }

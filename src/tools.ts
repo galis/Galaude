@@ -5,6 +5,8 @@ import { promisify } from "node:util";
 import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
+import { renderMemory, normalizeMemory } from "./memory.js";
+import { loadGlobalMemory, saveGlobalMemory } from "./store.js";
 import type { AgentEvent } from "./agent.js";
 
 const execFileAsync = promisify(execFile);
@@ -113,6 +115,38 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
           new_string: { type: "string", description: "替换成的新内容" },
         },
         required: ["path", "old_string", "new_string"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memoryread",
+      description:
+        "读取当前长期记忆（用户偏好、项目约定、关键决定等）。开始新任务前、或需要了解背景时调用。无参数。",
+      parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "memorywrite",
+      description:
+        "写入长期记忆（整表覆盖：每次传【完整】facts 数组，不是增量）。" +
+        "用户说了值得长期记住的事（偏好、约定、决定、身份信息、项目规则等），用此工具记下来。" +
+        "想删一条 → 读 → 去掉那条 → 写回剩余。想加一条 → 读 → 拼接 → 写回。" +
+        "不要记琐碎/临时信息（对话历史已有），只记跨会话需要保留的关键事实。",
+      parameters: {
+        type: "object",
+        properties: {
+          facts: {
+            type: "array",
+            description: "完整的记忆事实数组（全量替换），例如 ['用户叫 Junqian', '项目约定：用 pnpm']",
+            items: { type: "string" },
+          },
+        },
+        required: ["facts"],
         additionalProperties: false,
       },
     },
@@ -320,6 +354,31 @@ export interface ToolCtx {
 type StatefulToolImpl = (args: Record<string, unknown>, ctx: ToolCtx) => string;
 
 export const statefulTools: Record<string, StatefulToolImpl> = {
+  memoryread(_args, _ctx) {
+    const mem = loadGlobalMemory();
+    return mem.length
+      ? renderMemory(mem)
+      : "（长期记忆为空。用户说了值得记住的事可用 memorywrite 记下来。）";
+  },
+
+  memorywrite({ facts }, ctx) {
+    // F1 截断自守：本轮输出被截断 → 拒写，旧记忆纹丝不动。
+    if (ctx.finishReason === "length")
+      return "⚠️ 上次输出被截断，未写入记忆（避免残表覆盖）。请拆成更小的更新重试。";
+
+    const r = normalizeMemory(facts);
+    saveGlobalMemory(r.facts);
+    ctx.emit({ type: "note", text: `🧠 记忆已更新（${r.facts.length} 条${r.dropped ? `，${r.dropped} 条被丢弃` : ""}）` });
+
+    const notes: string[] = [];
+    if (r.dropped) notes.push(`${r.dropped} 条被过滤（空/重复/超限）`);
+    return (
+      "已更新。\n" +
+      renderMemory(r.facts) +
+      (notes.length ? "\n（注：" + notes.join("；") + "）" : "")
+    );
+  },
+
   todoread(_args, ctx) {
     return ctx.plan.todos.length
       ? renderTodos(ctx.plan.todos)

@@ -19,6 +19,8 @@ import {
   type SessionMeta,
 } from "./store.js";
 import { type Todo } from "./todo.js";
+import { renderMemory } from "./memory.js";
+import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
 import { config } from "./config.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
@@ -35,6 +37,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/history", desc: "打印当前历史的 role 时间线" },
   { name: "/context", desc: "显示当前上下文占用情况" },
   { name: "/todo", desc: "显示当前任务清单（只读；增删让 agent 代劳）" },
+  { name: "/memory", desc: "显示当前长期记忆（只读；增删让 agent 代劳）" },
   { name: "/mode", desc: "切换确认模式 auto（判风险才确认）/ strict（一律确认）" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
@@ -49,7 +52,8 @@ type Item =
   | { kind: "tool_call"; name: string; argsText: string }
   | { kind: "tool_result"; result: string }
   | { kind: "note"; text: string }
-  | { kind: "todos"; todos: Todo[] };
+  | { kind: "todos"; todos: Todo[] }
+  | { kind: "memory"; text: string };
 
 // 用户侧任务状态图标（BMP 符号，避开 emoji 列宽坑；模型侧另用 [x]/[~]/[ ]）。
 const TODO_ICON: Record<Todo["status"], string> = {
@@ -90,6 +94,8 @@ function itemLines(it: Item, width: number): Line[] {
         ]);
       return lines;
     }
+    case "memory":
+      return plainToLines(it.text, width, { color: "blue" });
   }
 }
 
@@ -306,6 +312,10 @@ function App({ session }: { session: Session }) {
         return session.plan.todos.length
           ? push({ kind: "todos", todos: session.plan.todos })
           : push({ kind: "note", text: "（任务清单为空）" });
+      }
+      if (text === "/memory") {
+        const merged = [...loadGlobalMemory(), ...session.memory];
+        return push({ kind: "memory", text: renderMemory(merged) });
       }
       if (text === "/mode" || text.startsWith("/mode ")) {
         const arg = text.slice(5).trim();

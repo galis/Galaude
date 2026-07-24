@@ -1,5 +1,6 @@
 import type OpenAI from "openai";
 import { config } from "./config.js";
+import { renderMemory } from "./memory.js";
 import { renderTodos, type TodoPlan } from "./todo.js";
 
 type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -74,7 +75,8 @@ export interface CompressState<M = OAIMessage> {
   messages: M[];
   summaries: SummarySegment[];
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖（messages[0]=system 不算）
-  memory: string[];
+  memory: string[]; // 会话级记忆（自动抽取的事实）
+  globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json，跨会话共享）
   lastPromptTokens: number;
   plan?: TodoPlan; // 任务清单（豁免压缩、每轮回注）
 }
@@ -114,9 +116,6 @@ function trimOldToolOutputs<M>(ops: MessageOps<M>, messages: M[]): M[] {
 
 // ———————————————————— 层 B/C：摘要 + 外置记忆 ————————————————————
 
-const memoryText = (memory: string[]) =>
-  "【已知事实（请始终遵守）】\n" + memory.map((s) => "- " + s).join("\n");
-
 const summaryText = (summaries: SummarySegment[]) =>
   "【早前对话摘要（更久远的历史已折叠成下面要点）】\n" +
   summaries.map((s) => s.text).join("\n\n");
@@ -135,10 +134,12 @@ const todoText = (plan: TodoPlan) =>
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
  */
 export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[] {
-  const { messages, summaries, summarizedUpTo: k, memory, lastPromptTokens, plan } = s;
+  const { messages, summaries, summarizedUpTo: k, memory, globalMemory, lastPromptTokens, plan } = s;
   const system = messages[0];
   const ctx: M[] = system ? [system] : [];
-  if (memory.length) ctx.push(ops.system(memoryText(memory)));
+  // 合并全局 + 会话级记忆，全局在前
+  const merged = [...(globalMemory ?? []), ...memory];
+  if (merged.length) ctx.push(ops.system(renderMemory(merged)));
   if (summaries.length) ctx.push(ops.system(summaryText(summaries)));
   if (plan && plan.todos.length) ctx.push(ops.system(todoText(plan))); // 任务清单：记忆/摘要后·近段前，豁免压缩
 

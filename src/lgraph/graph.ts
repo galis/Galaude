@@ -25,6 +25,7 @@ import {
 } from "@langchain/core/messages";
 import { config } from "../config.js";
 import { emptyPlan, type TodoPlan } from "../todo.js";
+import { loadGlobalMemory } from "../store.js";
 import {
   toolSchemas,
   pureTools,
@@ -275,6 +276,7 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
     summaries: state.summaries,
     summarizedUpTo: state.summarizedUpTo,
     memory: state.memory,
+    globalMemory: loadGlobalMemory(),
     lastPromptTokens: state.lastPromptTokens,
     plan: state.plan,
   });
