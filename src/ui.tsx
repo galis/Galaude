@@ -17,6 +17,7 @@ import {
 } from "./skill.js";
 import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
+import { describeToolBrief } from "./tools.js";
 import { config } from "./config.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
 import { scanCommands, expandCommand, type CommandMeta } from "./commands.js";
@@ -80,8 +81,12 @@ function itemLines(it: Item, width: number): Line[] {
       ls[0] = [{ text: "🤖 " }, ...ls[0]!]; // 首行前面挂上机器人标记
       return ls;
     }
-    case "tool_call":
-      return plainToLines(`🔧 ${it.name}`, width, { color: "yellow" }); // 只显示工具名
+    case "tool_call": {
+      const desc = it.argsText
+        ? describeToolBrief(it.name, it.argsText)
+        : it.name;
+      return plainToLines(`🔧 ${desc}`, width, { color: "yellow" });
+    }
     case "tool_result":
       return plainToLines(" ↳ " + it.result, width, { color: "green" });
     case "note":
@@ -136,7 +141,7 @@ function messagesToItems(messages: Message[]): Item[] {
         .tool_calls;
       if (tcs)
         for (const tc of tcs)
-          out.push({ kind: "tool_call", name: tc.function.name, argsText: "" });
+          out.push({ kind: "tool_call", name: tc.function.name, argsText: tc.function.arguments });
     }
     // role:"tool"（工具结果）恢复时不铺到界面——只在日志里
   }
@@ -196,6 +201,9 @@ function App({ session }: { session: Session }) {
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
+  const [outputTokens, setOutputTokens] = useState(0); // 累积输出 token
+  const [inputTokens, setInputTokens] = useState(0); // 累积输入 token（prompt）
+  const [requestCount, setRequestCount] = useState(0); // 已发请求次数
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
@@ -229,6 +237,9 @@ function App({ session }: { session: Session }) {
       adoptSession(session, ns);
       setPicker(null);
       setCtxTokens(ns.lastPromptTokens); // ctx 占比切到目标会话
+      setInputTokens(0); // 新会话输入 token 从零开始
+      setOutputTokens(0); // 新会话输出 token 从零开始
+      setRequestCount(0); // 请求次数从零开始
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
@@ -284,6 +295,9 @@ function App({ session }: { session: Session }) {
         setHistory([]); // 新会话输入历史清空
         histPosRef.current = null;
         setCtxTokens(0);
+        setInputTokens(0);
+        setOutputTokens(0);
+        setRequestCount(0);
         setTodos([]);
         setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
       };
@@ -394,11 +408,14 @@ function App({ session }: { session: Session }) {
           acc = "";
           setStreaming("");
           setActiveTools((n) => n + 1); // 起一个工具
-          push({ kind: "tool_call", name: ev.name, argsText: "" }); // 只留工具名，不显示参数
+          push({ kind: "tool_call", name: ev.name, argsText: ev.argsText });
         } else if (ev.type === "tool_result") {
           setActiveTools((n) => Math.max(0, n - 1)); // 完成一个；结果不显示（在日志里）
         } else if (ev.type === "usage") {
           setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
+          setInputTokens((n) => n + ev.promptTokens); // 累积输入 token
+          setOutputTokens((n) => n + ev.completionTokens); // 累积输出 token
+          setRequestCount((n) => n + 1); // 请求计数
         } else if (ev.type === "note") {
           push({ kind: "note", text: ev.text }); // 如「已折叠」提示
         } else if (ev.type === "todos") {
@@ -500,8 +517,12 @@ function App({ session }: { session: Session }) {
         return;
       }
 
-      // —— 生成中：只允许滚动（上面已处理），其余忽略 ——
-      if (busyRef.current) return;
+      // —— 生成中：只允许滚动和 ESC 中断，其余忽略 ——
+      if (busyRef.current) {
+        const escAlone = s.includes("\x1b") && !s.includes("\x1b[");
+        if (escAlone) abortRef.current?.abort();
+        return;
+      }
 
       // —— 会话选择器：↑↓ 选、Enter 切换、Esc 取消 ——
       if (pickerRef.current) {
@@ -664,6 +685,21 @@ function App({ session }: { session: Session }) {
       <Text color="magentaBright">
         🌀 Galaude · Ink UI —— /help，/exit
         <Text color={mode === "auto" ? "green" : "yellow"}> [{mode}]</Text>
+        {requestCount > 0 ? (
+          <Text dimColor>
+            {"  "}🔢 {requestCount}次
+          </Text>
+        ) : null}
+        {inputTokens > 0 ? (
+          <Text dimColor>
+            {"  "}📥 {inputTokens >= 1000 ? `${(inputTokens / 1000).toFixed(1)}k` : inputTokens}
+          </Text>
+        ) : null}
+        {outputTokens > 0 ? (
+          <Text dimColor>
+            {"  "}📤 {outputTokens >= 1000 ? `${(outputTokens / 1000).toFixed(1)}k` : outputTokens}
+          </Text>
+        ) : null}
         {ctxTokens > 0 ? (
           <Text dimColor>
             {"  "}ctx {Math.round((ctxTokens / config.compress.budget) * 100)}%

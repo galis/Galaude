@@ -13,7 +13,7 @@ export type AgentEvent =
   | { type: "assistant"; text: string } // 回答正文增量
   | { type: "tool_call"; name: string; argsText: string }
   | { type: "tool_result"; name: string; result: string }
-  | { type: "usage"; promptTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）
+  | { type: "usage"; promptTokens: number; completionTokens: number } // 本轮模型实际看到的 prompt token（=投影大小）与输出 token
   | { type: "note"; text: string } // 系统提示（如「已折叠」），界面当一条 note 显示
   | { type: "todos"; todos: Todo[] } // 任务清单变更，界面据此刷新面板
   | { type: "debug"; text: string };

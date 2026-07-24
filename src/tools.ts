@@ -772,3 +772,71 @@ export async function describeForApproval(
 
   return `${name}(${JSON.stringify(args)})`;
 }
+
+/**
+ * 给工具调用生成一行人类可读摘要（纯同步，不做文件 IO）。
+ * UI 在用：agent 每发出一轮 tool_call 事件时，界面用这个摘要代替干巴巴的工具名。
+ */
+export function describeToolBrief(name: string, argsText: string): string {
+  let args: Record<string, unknown>;
+  try {
+    args = JSON.parse(argsText || "{}");
+  } catch {
+    // JSON 解析失败就直接显示原始文本（截断）
+    return `${name}(${argsText.length > 60 ? argsText.slice(0, 60) + "…" : argsText})`;
+  }
+
+  switch (name) {
+    case "calculate":
+      return `calculate("${String(args.expression ?? "").trim()}")`;
+    case "run_bash":
+      return `run_bash $ ${String(args.command ?? "").trim()}`;
+    case "read_file":
+      return `read_file ${String(args.path ?? "").trim()}`;
+    case "write_file": {
+      const p = String(args.path ?? "").trim();
+      const c = String(args.content ?? "");
+      const lines = c.split("\n").length;
+      const bytes = Buffer.byteLength(c);
+      return `write_file ${p}（${lines} 行，${bytes} B）`;
+    }
+    case "edit_file": {
+      const p = String(args.path ?? "").trim();
+      const oldS = String(args.old_string ?? "");
+      const newS = String(args.new_string ?? "");
+      return `edit_file ${p}\n${lineDiff(oldS, newS, 10)}`;
+    }
+    case "memoryread":
+      return "memoryread";
+    case "memorywrite": {
+      const facts = args.facts as string[] | undefined;
+      return `memorywrite [${Array.isArray(facts) ? facts.length : 0} 条]`;
+    }
+    case "todoread":
+      return "todoread";
+    case "todowrite": {
+      const todos = args.todos as unknown[] | undefined;
+      return `todowrite [${Array.isArray(todos) ? todos.length : 0} 项]`;
+    }
+    case "batch_read_file": {
+      const paths = args.paths as string[] | undefined;
+      if (!Array.isArray(paths) || paths.length === 0)
+        return "batch_read_file（空列表）";
+      return `batch_read_file [${paths.length} 个文件]`;
+    }
+    case "batch_write_file": {
+      const files = args.files as unknown[] | undefined;
+      return `batch_write_file [${Array.isArray(files) ? files.length : 0} 个文件]`;
+    }
+    case "batch_edit_file": {
+      const edits = args.edits as unknown[] | undefined;
+      return `batch_edit_file [${Array.isArray(edits) ? edits.length : 0} 个文件]`;
+    }
+    case "batch_run_bash": {
+      const cmds = args.commands as string[] | undefined;
+      return `batch_run_bash [${Array.isArray(cmds) ? cmds.length : 0} 条]`;
+    }
+    default:
+      return `${name}(${JSON.stringify(args)})`;
+  }
+}

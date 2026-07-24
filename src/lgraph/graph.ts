@@ -321,8 +321,9 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
     logger.log(`[拼好的 tool_calls]\n${JSON.stringify(aiMsg.tool_calls, null, 2)}`);
 
   const inTok = acc?.usage_metadata?.input_tokens ?? 0;
+  const outTok = acc?.usage_metadata?.output_tokens ?? 0;
   if (inTok > 0) {
-    emit({ type: "usage", promptTokens: inTok });
+    emit({ type: "usage", promptTokens: inTok, completionTokens: outTok });
     emit({
       type: "debug",
       text: `📊 token: prompt=${inTok} completion=${acc?.usage_metadata?.output_tokens ?? "?"} finish_reason=${
