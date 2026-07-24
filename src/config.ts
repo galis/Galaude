@@ -30,7 +30,7 @@ export const config = {
     : "langgraph") as "handwritten" | "langgraph",
 
   /** 单次用户输入内 think→act 的最大轮数上限，防死循环（env: MAX_TURNS） */
-  maxTurns: envNum("MAX_TURNS", 30),
+  maxTurns: envNum("MAX_TURNS", 100),
 
   /** run_bash 单条命令超时毫秒数（env: BASH_TIMEOUT_MS）。构建/测试类命令常超 15s，默认给 60s。 */
   bashTimeoutMs: envNum("BASH_TIMEOUT_MS", 60_000),
