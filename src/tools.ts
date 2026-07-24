@@ -51,7 +51,8 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         "在本机执行一条 bash 命令并返回输出（stdout+stderr+退出码）。" +
         "适合看目录、查日期/系统信息、跑构建/测试/git 等命令行工具。" +
         "例如 'ls -la'、'date'、'npm test'、'git status'。" +
-        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。",
+        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。" +
+        "多条独立命令用 batch_run_bash 一次并发执行。",
       parameters: {
         type: "object",
         properties: {
@@ -277,12 +278,36 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "batch_run_bash",
+      description:
+        "一次执行多条独立的 bash 命令并返回各自的输出（stdout+stderr+退出码）。" +
+        "多条命令间无依赖时可并发执行，比逐条调用 run_bash 更快。" +
+        "例如同时查看多个目录、同时检查多个文件状态。" +
+        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。",
+      parameters: {
+        type: "object",
+        properties: {
+          commands: {
+            type: "array",
+            description: "要执行的 bash 命令列表，例如 ['ls -la', 'git status', 'date']",
+            items: { type: "string" },
+          },
+        },
+        required: ["commands"],
+        additionalProperties: false,
+      },
+    },
+  },
 ];
 
 // 需要先经用户确认才执行的「危险」工具（有副作用 / 能跑任意命令）。
 // read_file / calculate 只读或纯计算，无副作用，不需要确认。
 export const needsApproval = new Set<string>([
   "run_bash",
+  "batch_run_bash",
   "write_file",
   "edit_file",
   "batch_write_file",
@@ -313,9 +338,13 @@ export function ruleRisk(
   name: string,
   args: Record<string, unknown>
 ): string | null {
-  if (name === "run_bash") {
-    const cmd = String(args.command ?? "");
-    for (const [re, why] of BASH_RISK_RULES) if (re.test(cmd)) return why;
+  if (name === "run_bash" || name === "batch_run_bash") {
+    const cmds = name === "batch_run_bash"
+      ? (args.commands as string[] ?? [])
+      : [String(args.command ?? "")];
+    for (const cmd of cmds)
+      for (const [re, why] of BASH_RISK_RULES)
+        if (re.test(cmd)) return `${name === "batch_run_bash" ? "批量命令: " : ""}${why}`;
     return null;
   }
   if (name === "write_file" || name === "edit_file") {
@@ -413,6 +442,39 @@ export const pureTools: Record<string, ToolImpl> = {
       const status = err.signal ?? err.code ?? "?";
       return `exit=${status}\n${out || err.message || "(出错)"}`;
     }
+  },
+
+  async batch_run_bash({ commands }) {
+    const arr = commands as string[] | undefined;
+    if (!Array.isArray(arr) || arr.length === 0)
+      throw new Error("commands 为空或不是数组");
+    const clip = (s: string) =>
+      s.length > 2000 ? s.slice(0, 2000) + "\n…(输出已截断)" : s;
+    const runOne = async (cmd: string, i: number) => {
+      const c = cmd.trim();
+      if (!c) return `[${i}] (空命令)`;
+      try {
+        const { stdout, stderr } = await execFileAsync("bash", ["-c", c], {
+          encoding: "utf8",
+          timeout: config.bashTimeoutMs,
+          maxBuffer: 1024 * 1024,
+        });
+        return `[${i}] exit=0\n${clip(`${stdout}${stderr}`) || "(无输出)"}`;
+      } catch (e) {
+        const err = e as {
+          code?: number | string;
+          signal?: string;
+          stdout?: string;
+          stderr?: string;
+          message?: string;
+        };
+        const out = clip(`${err.stdout ?? ""}${err.stderr ?? ""}`);
+        const status = err.signal ?? err.code ?? "?";
+        return `[${i}] exit=${status}\n${out || err.message || "(出错)"}`;
+      }
+    };
+    const results = await Promise.all(arr.map((cmd, i) => runOne(String(cmd ?? ""), i + 1)));
+    return results.join("\n\n");
   },
 
   async read_file({ path }) {
@@ -629,6 +691,11 @@ export async function describeForApproval(
   args: Record<string, unknown>
 ): Promise<string> {
   if (name === "run_bash") return `$ ${String(args.command ?? "")}`;
+  if (name === "batch_run_bash") {
+    const cmds = args.commands as string[] | undefined;
+    if (!Array.isArray(cmds) || cmds.length === 0) return "batch_run_bash（空列表）";
+    return `批量执行 ${cmds.length} 条命令:\n${cmds.map((c, i) => `  ${i + 1}. $ ${String(c ?? "").trim() || "(空)"}`).join("\n")}`;
+  }
 
   if (name === "write_file") {
     const p = String(args.path ?? "");
