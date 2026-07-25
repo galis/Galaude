@@ -29,6 +29,7 @@ export interface Session {
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
   memory: string[]; // 会话级外置关键事实（P3 自动抽取），豁免压缩
   globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json），每轮注入前读取
+  projectMemory?: string[]; // 项目记忆（.galaude/project-memory.json），每轮注入前读取
   plan: TodoPlan; // 任务清单（模型驱动，每轮回注上下文）
 }
 
@@ -83,6 +84,7 @@ export function adoptSession(target: Session, source: Session): void {
   target.summaries = source.summaries;
   target.summarizedUpTo = source.summarizedUpTo;
   target.memory = source.memory;
+  target.projectMemory = source.projectMemory;
   target.plan = source.plan;
 }
 

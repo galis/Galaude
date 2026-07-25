@@ -6,7 +6,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import { renderMemory, normalizeMemory } from "./memory.js";
-import { loadGlobalMemory, saveGlobalMemory } from "./store.js";
+import { loadGlobalMemory, loadProjectMemory, saveProjectMemory } from "./store.js";
 import type { AgentEvent } from "./events.js";
 
 const execFileAsync = promisify(execFile);
@@ -372,9 +372,11 @@ type StatefulToolImpl = (args: Record<string, unknown>, ctx: ToolCtx) => string;
 
 export const statefulTools: Record<string, StatefulToolImpl> = {
   memoryread(_args, _ctx) {
-    const mem = loadGlobalMemory();
-    return mem.length
-      ? renderMemory(mem)
+    const project = loadProjectMemory();
+    const global = loadGlobalMemory();
+    const merged = [...project, ...global];
+    return merged.length
+      ? renderMemory(merged)
       : "（长期记忆为空。用户说了值得记住的事可用 memorywrite 记下来。）";
   },
 
@@ -384,13 +386,13 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
       return "⚠️ 上次输出被截断，未写入记忆（避免残表覆盖）。请拆成更小的更新重试。";
 
     const r = normalizeMemory(facts);
-    saveGlobalMemory(r.facts);
-    ctx.emit({ type: "note", text: `🧠 记忆已更新（${r.facts.length} 条${r.dropped ? `，${r.dropped} 条被丢弃` : ""}）` });
+    saveProjectMemory(r.facts);
+    ctx.emit({ type: "note", text: `🧠 项目记忆已更新（${r.facts.length} 条${r.dropped ? `，${r.dropped} 条被丢弃` : ""}）` });
 
     const notes: string[] = [];
     if (r.dropped) notes.push(`${r.dropped} 条被过滤（空/重复/超限）`);
     return (
-      "已更新。\n" +
+      "已更新（项目记忆，`.galaude/project-memory.json`）。\n" +
       renderMemory(r.facts) +
       (notes.length ? "\n（注：" + notes.join("；") + "）" : "")
     );
@@ -441,7 +443,7 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
 }
 
 // 行级 diff：剥掉公共前后缀，变化中段的前3行/后3行留作上下文，中间按 -旧 / +新 展示。
-export function lineDiff(oldText: string, newText: string, max = 16, ctx = 3): string {
+export function lineDiff(oldText: string, newText: string, max = 16, ctx = 3, startLine = 0): string {
   const a = oldText.split("\n");
   const b = newText.split("\n");
   let p = 0;
@@ -453,7 +455,7 @@ export function lineDiff(oldText: string, newText: string, max = 16, ctx = 3): s
   const preCtx = Math.max(0, p - ctx);
   const postCtxA = Math.min(a.length, ea + ctx);
   const postCtxB = Math.min(b.length, eb + ctx);
-  const ln = (n: number) => String(n + 1).padStart(4); // 1-based 行号，4 位右对齐
+  const ln = (n: number) => String(startLine + n + 1).padStart(4); // 1-based 真实行号
   const out: string[] = [];
   if (preCtx < p) {
     for (let i = preCtx; i < p; i++) out.push(`  ${ln(i)} ${a[i]}`);
@@ -500,13 +502,16 @@ export async function describeForApproval(
     const oldS = String(args.old_string ?? "");
     const newS = String(args.new_string ?? "");
     let warn = "";
+    let startLine = 0;
     try {
       const content = await readFile(p, "utf8");
-      if (!content.includes(oldS)) warn = "\n⚠️ 未找到要替换的内容（执行会失败）";
+      const idx = content.indexOf(oldS);
+      if (idx === -1) warn = "\n⚠️ 未找到要替换的内容（执行会失败）";
+      else startLine = content.slice(0, idx).split("\n").length - 1; // 0-based
     } catch {
       warn = "\n⚠️ 读不到该文件（执行会失败）";
     }
-    return `编辑 ${p}${warn}\n${lineDiff(oldS, newS)}`;
+    return `编辑 ${p}${warn}\n${lineDiff(oldS, newS, 16, 3, startLine)}`;
   }
 
   return `${name}(${JSON.stringify(args)})`;

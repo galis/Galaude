@@ -18,7 +18,7 @@ import {
   parseRisk,
   parseSummary,
 } from "./llmtasks.js";
-import { loadGlobalMemory } from "./store.js";
+import { loadGlobalMemory, loadProjectMemory } from "./store.js";
 import {
   buildContext,
   shouldCompact,
@@ -393,6 +393,8 @@ export async function runAgent(
 
   // 每轮注入前刷新全局记忆（跨会话共享 → 新会话也能看到之前记下的事实）
   session.globalMemory = loadGlobalMemory();
+  // 每轮注入前刷新项目记忆（当前项目的架构/约定，与全局记忆互补）
+  session.projectMemory = loadProjectMemory();
 
   // 轮边界：上下文偏大就先把最旧的若干完整轮折叠成摘要，再开始这一轮（不折当前在飞轮）。
   await maybeCompact(session, emit, signal);

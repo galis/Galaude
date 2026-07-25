@@ -78,6 +78,7 @@ export interface CompressState<M = OAIMessage> {
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖（messages[0]=system 不算）
   memory: string[]; // 会话级记忆（自动抽取的事实）
   globalMemory?: string[]; // 全局记忆（~/.galaude/memory.json，跨会话共享）
+  projectMemory?: string[]; // 项目记忆（.galaude/project-memory.json），注入在全局记忆前
   lastPromptTokens: number;
   plan?: TodoPlan; // 任务清单（豁免压缩、每轮回注）
 }
@@ -135,7 +136,7 @@ const todoText = (plan: TodoPlan) =>
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
  */
 export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[] {
-  const { messages, summaries, summarizedUpTo: k, memory, globalMemory, lastPromptTokens, plan } = s;
+  const { messages, summaries, summarizedUpTo: k, memory, globalMemory, projectMemory, lastPromptTokens, plan } = s;
   const system = messages[0];
   const ctx: M[] = system ? [system] : [];
   // Skill 第一层（常驻注入）：name + description，模型判断匹配后用 read_file 自行读取
@@ -143,8 +144,8 @@ export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[
   if (skills.length) ctx.push(ops.system(renderSkillIndex(skills)));
   // 项目路径（常驻注入）：模型做文件操作时以此为根
   ctx.push(ops.system(`当前工作目录: ${process.cwd()}`));
-  // 合并全局 + 会话级记忆，全局在前
-  const merged = [...(globalMemory ?? []), ...memory];
+  // 合并项目记忆 + 全局记忆 + 会话级记忆，项目记忆在最前（最稳定）
+  const merged = [...(projectMemory ?? []), ...(globalMemory ?? []), ...memory];
   if (merged.length) ctx.push(ops.system(renderMemory(merged)));
   if (summaries.length) ctx.push(ops.system(summaryText(summaries)));
   if (plan && plan.todos.length) ctx.push(ops.system(todoText(plan))); // 任务清单：记忆/摘要后·近段前，豁免压缩

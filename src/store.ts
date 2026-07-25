@@ -167,3 +167,30 @@ export function loadGlobalMemory(): string[] {
 export function saveGlobalMemory(facts: string[]): void {
   atomicWriteGlobal(GLOBAL_MEMORY, JSON.stringify(facts, null, 2));
 }
+
+// —— 项目记忆（<cwd>/.galaude/project-memory.json），当前项目的架构/约定等 ——
+
+const PROJECT_MEMORY = join(process.cwd(), ".galaude", "project-memory.json");
+
+function atomicWriteProject(target: string, data: string): void {
+  mkdirSync(join(process.cwd(), ".galaude"), { recursive: true });
+  const tmp = `${target}.tmp`;
+  writeFileSync(tmp, data);
+  renameSync(tmp, target);
+}
+
+/** 加载项目记忆（当前项目的架构、约定、设计决策等）。文件不存在返回 []。 */
+export function loadProjectMemory(): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(PROJECT_MEMORY, "utf8"));
+    if (Array.isArray(raw)) return raw.filter((x): x is string => typeof x === "string");
+  } catch {
+    /* 文件不存在或损坏 */
+  }
+  return [];
+}
+
+/** 保存项目记忆（原子 temp+rename）。 */
+export function saveProjectMemory(facts: string[]): void {
+  atomicWriteProject(PROJECT_MEMORY, JSON.stringify(facts, null, 2));
+}

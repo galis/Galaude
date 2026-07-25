@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
 import { createSession, resumeSession, adoptSession, persist, type Session } from "./session.js";
@@ -73,8 +74,21 @@ const TODO_ICON: Record<Todo["status"], string> = {
 // 把一条 Item 摊成「带样式的行」（Line=Span[]），便于做行级滚动窗口。
 // assistant 内容走 markdown 渲染；其余纯文本套基础样式。
 
-/** 比较新旧文本，返回着色行：上下文白色，删除行红色，增加行绿色。前后各留 3 行上下文。 */
-function coloredDiff(oldText: string, newText: string, max = 16): Line[] {
+/** 同步读文件，算 oldStr 的 0-based 起始行号。失败返回 0。 */
+function fileStartLine(path: string, oldStr: string): number {
+  try {
+    const content = readFileSync(path, "utf8");
+    const idx = content.indexOf(oldStr);
+    if (idx === -1) return 0;
+    return content.slice(0, idx).split("\n").length - 1;
+  } catch {
+    return 0;
+  }
+}
+
+/** 比较新旧文本，返回着色行：上下文白色，删除行红色，增加行绿色。前后各留 3 行上下文。
+ *  startLine 是 oldText 在原文件中的 0-based 起始行号。 */
+function coloredDiff(oldText: string, newText: string, max = 16, startLine = 0): Line[] {
   const a = oldText.split("\n");
   const b = newText.split("\n");
   let p = 0;
@@ -88,7 +102,7 @@ function coloredDiff(oldText: string, newText: string, max = 16): Line[] {
   const postCtxA = Math.min(a.length, ea + ctx);
   const postCtxB = Math.min(b.length, eb + ctx);
 
-  const ln = (n: number) => String(n + 1).padStart(4); // 1-based 行号
+  const ln = (n: number) => String(startLine + n + 1).padStart(4); // 1-based 真实行号
   const lines: Line[] = [];
   // 上文（白色）
   if (preCtx < p) {
@@ -123,8 +137,9 @@ function toolCallEditLines(
     const p = String(args.path ?? "").trim();
     const oldS = String(args.old_string ?? "");
     const newS = String(args.new_string ?? "");
+    const sl = fileStartLine(p, oldS);
     lines.push([{ text: `  ${p}`, dim: true }]);
-    lines.push(...coloredDiff(oldS, newS, 10));
+    lines.push(...coloredDiff(oldS, newS, 10, sl));
   } else if (name === "batch_edit_file") {
     const edits =
       (args.edits as
@@ -134,8 +149,9 @@ function toolCallEditLines(
       const ep = String(e.path ?? "").trim();
       const oldS = String(e.old_string ?? "");
       const newS = String(e.new_string ?? "");
+      const sl = fileStartLine(ep, oldS);
       lines.push([{ text: `  ${ep}`, dim: true }]);
-      lines.push(...coloredDiff(oldS, newS, 6));
+      lines.push(...coloredDiff(oldS, newS, 6, sl));
     }
   }
 
@@ -811,7 +827,7 @@ function App({ session }: { session: Session }) {
             touched = true;
           }
         } else if (ch === "\n") {
-          // 粘贴中的 \n：插入换行（bare \n）；非粘贴时直接忽略（不使用 Ctrl+J）
+          // 粘贴中的 \n：插入换行（bare \n）；非粘贴时直接忽略
           if (pasteRef.current) {
             inp = inp.slice(0, cur) + "\n" + inp.slice(cur);
             cur += 1;
