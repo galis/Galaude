@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { config } from "./config.js";
+import { promises as dns } from "node:dns";
 
 /**
  * DeepSeek 走 OpenAI 兼容协议，所以直接用官方 openai SDK，
@@ -18,6 +19,9 @@ export const client = new OpenAI({
   apiKey: process.env.DEEPSEEK_API_KEY,
   baseURL: "https://api.deepseek.com",
 });
+
+// 预解析 DNS：模块加载时后台触发，首次 HTTPS 请求省掉 DNS 查询的 RTT
+dns.lookup("api.deepseek.com").catch(() => {});
 
 export const MODEL = config.model;
 /** 内部辅助调用（风险判断/摘要/折叠）用的轻量模型（env: FLASH_MODEL） */

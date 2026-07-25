@@ -6,6 +6,13 @@ import { runAgent as runHandwritten } from "./agent.js";
 import { type Session } from "./session.js";
 import { type Emitter, type ToolApprover } from "./events.js";
 
+// 启动时立刻触发 LangGraph 的后台预加载（不阻塞 UI 渲染）。
+// 首次请求只需 await 这个 promise，而不是现场 import 全家桶。
+let _lgReady: Promise<typeof import("./lgraph/engine.js")> | undefined;
+if (config.engine === "langgraph") {
+  _lgReady = import("./lgraph/engine.js");
+}
+
 export async function runAgent(
   session: Session,
   userInput: string,
@@ -14,8 +21,7 @@ export async function runAgent(
   approve?: ToolApprover
 ): Promise<string> {
   if (config.engine === "langgraph") {
-    // 惰性加载：手写引擎不用背 LangChain 全家桶的启动开销
-    const { runAgentLG } = await import("./lgraph/engine.js");
+    const { runAgentLG } = await _lgReady!;
     return runAgentLG(session, userInput, emit, signal, approve);
   }
   // 注意透传 undefined 而不是自己填默认值：手写引擎靠「approve === autoApprove
