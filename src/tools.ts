@@ -453,19 +453,18 @@ export function lineDiff(oldText: string, newText: string, max = 16, ctx = 3, st
   while (ea > p && eb > p && a[ea - 1] === b[eb - 1]) (ea--, eb--);
   // 公共前缀后缀的上下文
   const preCtx = Math.max(0, p - ctx);
-  const postCtxA = Math.min(a.length, ea + ctx);
   const postCtxB = Math.min(b.length, eb + ctx);
   const ln = (n: number) => String(startLine + n + 1).padStart(4); // 1-based 真实行号
   const out: string[] = [];
   if (preCtx < p) {
-    for (let i = preCtx; i < p; i++) out.push(`  ${ln(i)} ${a[i]}`);
     out.push("  …");
+    for (let i = preCtx; i < p; i++) out.push(`  ${ln(i)} ${a[i]}`);
   }
   for (let i = p; i < ea; i++) out.push(`- ${ln(i)} ${a[i]}`);
   for (let i = p; i < eb; i++) out.push(`+ ${ln(i)} ${b[i]}`);
-  if (ea < postCtxA) {
+  if (eb < postCtxB) {
+    for (let i = eb; i < postCtxB; i++) out.push(`  ${ln(i)} ${b[i]}`);
     out.push("  …");
-    for (let i = ea; i < postCtxA; i++) out.push(`  ${ln(i)} ${a[i]}`);
   }
   if (out.length === 0) return "(无变化)";
   return out.length > max
