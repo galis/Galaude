@@ -99,7 +99,6 @@ function coloredDiff(oldText: string, newText: string, max = 16, startLine = 0):
 
   const ctx = 3;
   const preCtx = Math.max(0, p - ctx);
-  const postCtxA = Math.min(a.length, ea + ctx);
   const postCtxB = Math.min(b.length, eb + ctx);
 
   const ln = (n: number) => String(startLine + n + 1).padStart(4); // 1-based 真实行号
@@ -114,9 +113,9 @@ function coloredDiff(oldText: string, newText: string, max = 16, startLine = 0):
   // 增加行（绿色）
   for (let i = p; i < eb; i++) lines.push([{ text: `  + ${ln(i)} ${b[i]}`, color: "green" }]);
   // 下文（白色）
-  if (ea < postCtxA) {
+  if (eb < postCtxB) {
+    for (let i = eb; i < postCtxB; i++) lines.push([{ text: `    ${ln(i)} ${b[i]}` }]);
     lines.push([{ text: "  …", dim: true }]);
-    for (let i = ea; i < postCtxA; i++) lines.push([{ text: `    ${ln(i)} ${a[i]}` }]);
   }
 
   if (lines.length === 0) return [[{ text: "  (无变化)", dim: true }]];
@@ -357,6 +356,7 @@ function App({ session }: { session: Session }) {
   const approveResolveRef = useRef<((ok: boolean) => void) | null>(null);
   const histPosRef = useRef<number | null>(null); // 当前浏览到的历史下标；null=未浏览
   const draftRef = useRef(""); // 进入历史浏览前暂存的草稿
+  const thinkingSinceRef = useRef(0); // 思考开始时间戳，0=不在思考
   // 会话切换选择器：list=候选会话元信息，index=高亮项（选中时才读完整文件）
   const [picker, setPicker] = useState<{
     list: SessionMeta[];
@@ -928,9 +928,15 @@ function App({ session }: { session: Session }) {
     ...(activeTools > 0
       ? [[{ text: `${spinner} 后台运行 ${activeTools} 个工具`, color: "yellow" }] as Line]
       : busy && !streaming
-        ? [[{ text: `${spinner} 思考中`, color: "yellow" }] as Line]
+        ? (() => {
+            if (!thinkingSinceRef.current) thinkingSinceRef.current = Date.now();
+            const sec = Math.floor((Date.now() - thinkingSinceRef.current) / 1000);
+            return [[{ text: `${spinner} ( ${sec}s ) 思考中`, color: "yellow" }] as Line];
+          })()
         : []),
   ];
+  // 离开思考状态时重置计时器
+  if (!(busy && !streaming && activeTools === 0)) thinkingSinceRef.current = 0;
   const maxScroll = Math.max(0, allLines.length - contentRows);
   const off = Math.min(scroll, maxScroll); // 自动跟随：内容增长时底部始终可见
   const end = allLines.length - off;
