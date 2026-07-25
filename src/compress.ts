@@ -141,6 +141,8 @@ export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[
   // Skill 第一层（常驻注入）：name + description，模型判断匹配后用 read_file 自行读取
   const skills = scanSkills();
   if (skills.length) ctx.push(ops.system(renderSkillIndex(skills)));
+  // 项目路径（常驻注入）：模型做文件操作时以此为根
+  ctx.push(ops.system(`当前工作目录: ${process.cwd()}`));
   // 合并全局 + 会话级记忆，全局在前
   const merged = [...(globalMemory ?? []), ...memory];
   if (merged.length) ctx.push(ops.system(renderMemory(merged)));

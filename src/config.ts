@@ -68,7 +68,7 @@ export const config = {
    */
   compress: {
     budget: envNum("CTX_BUDGET", 1*1024*1024),  // 上下文 token 预算 W（ctx 占比的分母）＝模型窗口
-    trimFrac: envNum("CTX_TRIM_FRAC", 0.5), // 投影 > budget*trimFrac 时开始裁旧工具输出（层 A）
+    trimFrac: envNum("CTX_TRIM_FRAC", 0.05), // 投影 > budget*trimFrac 时开始裁旧工具输出（层 A）
     summarizeFrac: envNum("CTX_SUM_FRAC", 0.7), // 投影 > budget*summarizeFrac 时折叠旧轮成摘要（层 B）
     keepRecentTools: envNum("CTX_KEEP_TOOLS", 4), // 最近几条 role:tool 输出留全
     keepRecentTurns: envNum("CTX_KEEP_TURNS", 3), // 最近几轮原文不折叠

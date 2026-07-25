@@ -177,12 +177,6 @@ function itemLines(it: Item, width: number): Line[] {
   }
 }
 
-// 计费逻辑已迁移到 src/billing.ts（时间感知：高峰 2x，非高峰原价）。
-/** 根据 token 数/模型名算价格字符串（UI 展示用） */
-function calcPrice(model: string, cacheMissTokens: number, cacheHitTokens: number, outputTokens: number): string {
-  return formatCost(calcCost(model, cacheMissTokens, cacheHitTokens, outputTokens));
-}
-
 // 取一组字符串的最长公共前缀（Tab 补全多个候选时用）。
 function commonPrefix(arr: string[]): string {
   if (arr.length === 0) return "";
@@ -314,6 +308,7 @@ function App({ session }: { session: Session }) {
   const [cacheMissTokens, setCacheMissTokens] = useState(0); // 累积缓存未命中 token
   const [cacheHitTokens, setCacheHitTokens] = useState(0); // 累积缓存命中 token
   const [requestCount, setRequestCount] = useState(0); // 已发请求次数
+  const [totalCost, setTotalCost] = useState(0); // 累积费用（按每笔请求的真实时间戳计价）
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
@@ -352,6 +347,7 @@ function App({ session }: { session: Session }) {
       setCacheMissTokens(0); // 新会话缓存 token 从零开始
       setCacheHitTokens(0);
       setRequestCount(0); // 请求次数从零开始
+      setTotalCost(0); // 累积费用重置
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
@@ -412,6 +408,7 @@ function App({ session }: { session: Session }) {
         setCacheMissTokens(0);
         setCacheHitTokens(0);
         setRequestCount(0);
+        setTotalCost(0);
         setTodos([]);
         setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
       };
@@ -490,23 +487,31 @@ function App({ session }: { session: Session }) {
         });
       }
       // —— 自定义命令（/ 开头且不在内置列表中）：展开模板后发送 ——
+      // 注意：如果首词本身包含 /（如粘贴的路径 /home/user/file），
+      // 则不是命令，直接当作普通消息处理。
+      let isCommand = false;
       if (text.startsWith("/")) {
-        const cmdName = text.split(/\s+/)[0]!.slice(1);
-        const cmd = customCommands.find((c) => c.name === cmdName);
-        if (cmd) {
-          const arg = text.slice(cmdName.length + 1).trim();
-          const expanded = expandCommand(cmdName, arg);
-          if (!expanded)
-            return push({ kind: "note", text: `❓ 命令模板加载失败: /${cmdName}` });
-          push({ kind: "user", text }); // 屏幕显示原始命令
-          text = expanded; // 传给模型的是展开后的 prompt
-          // 继续走下方 agent 流程
-        } else {
-          return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
+        const firstWord = text.split(/\s+/)[0]!;
+        const cmdName = firstWord.slice(1);
+        // 命令名含 / → 是文件路径，不是命令
+        if (!cmdName.includes("/")) {
+          const cmd = customCommands.find((c) => c.name === cmdName);
+          if (cmd) {
+            isCommand = true;
+            const arg = text.slice(cmdName.length + 1).trim();
+            const expanded = expandCommand(cmdName, arg);
+            if (!expanded)
+              return push({ kind: "note", text: `❓ 命令模板加载失败: /${cmdName}` });
+            push({ kind: "user", text }); // 屏幕显示原始命令
+            text = expanded; // 传给模型的是展开后的 prompt
+            // 继续走下方 agent 流程
+          } else {
+            return push({ kind: "note", text: `❓ 未知命令 ${text}（/help）` });
+          }
         }
       }
 
-      if (!text.startsWith("/")) { // 非命令：正常 push user 消息
+      if (!isCommand) { // 非命令：正常 push user 消息
         push({ kind: "user", text });
       }
       busyRef.current = true; // 同步置位（见函数开头的守卫说明）
@@ -533,6 +538,10 @@ function App({ session }: { session: Session }) {
           if (ch != null) setCacheHitTokens((n) => n + ch);
           if (cm != null) setCacheMissTokens((n) => n + cm);
           setRequestCount((n) => n + 1); // 请求计数
+          // 按本次请求的真实时间戳累加费用（而非最后一次性用「此刻」算）
+          setTotalCost((n) => n + calcCost(config.model,
+            ev.cacheMissTokens ?? 0, ev.cacheHitTokens ?? 0,
+            ev.completionTokens, ev.timestamp));
         } else if (ev.type === "note") {
           push({ kind: "note", text: ev.text }); // 如「已折叠」提示
         } else if (ev.type === "todos") {
@@ -886,7 +895,7 @@ function App({ session }: { session: Session }) {
         ) : null}
         {(inputTokens > 0 || outputTokens > 0) ? (
           <Text dimColor>
-            {"  "}💰 {calcPrice(config.model, cacheMissTokens, cacheHitTokens, outputTokens)}
+            {"  "}💰 {formatCost(totalCost)}
           </Text>
         ) : null}
         <Text dimColor> {peakLabel()}</Text>

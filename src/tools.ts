@@ -71,11 +71,20 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: "read_file",
       description:
-        "读取文本文件内容（带行号返回）。读文件请用本工具，不要用 run_bash 的 cat。",
+        "读取文本文件内容（带行号返回）。读文件请用本工具，不要用 run_bash 的 cat。支持 offset/limit 翻页读取大文件。",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "文件路径（相对或绝对）" },
+          offset: {
+            type: "integer",
+            description:
+              "从第几行开始返回（从1开始），默认1。读取超大文件被截断后，用 offset 补读后续内容",
+          },
+          limit: {
+            type: "integer",
+            description: "最多返回多少行，默认400。如需更多行数请增大此值",
+          },
         },
         required: ["path"],
         additionalProperties: false,
@@ -477,15 +486,22 @@ export const pureTools: Record<string, ToolImpl> = {
     return results.join("\n\n");
   },
 
-  async read_file({ path }) {
+  async read_file({ path, offset, limit }) {
     const p = String(path ?? "").trim();
     if (!p) throw new Error("path 为空");
     const content = await readFile(p, "utf8");
     const lines = content.split("\n");
-    const shown = lines.slice(0, 400); // 最多 400 行
-    const body = shown.map((l, i) => `${i + 1}\t${l}`).join("\n");
-    const more = lines.length > shown.length ? `\n…(共 ${lines.length} 行，省略其余)` : "";
-    return body + more || "(空文件)";
+    const start = Math.max(0, (Number(offset) || 1) - 1);
+    const rawLimit = Number(limit);
+    const max = rawLimit === -1 ? Infinity : (rawLimit || 2000);
+    const shown = lines.slice(start, start + max);
+    const body = shown.map((_, i) => `${start + i + 1}\t${shown[i]}`).join("\n");
+    const more =
+      lines.length > start + shown.length
+        ? `\n…(共 ${lines.length} 行，省略其余)`
+        : "";
+    const prefix = start > 0 ? `…(跳过前 ${start} 行)\n` : "";
+    return prefix + body + more || "(空文件)";
   },
 
   async write_file({ path, content }) {
@@ -513,20 +529,28 @@ export const pureTools: Record<string, ToolImpl> = {
   },
 
   async batch_read_file({ paths }) {
-    const arr = paths as string[] | undefined;
+    const arr = paths as (string | { path?: string; offset?: number; limit?: number })[] | undefined;
     if (!Array.isArray(arr) || arr.length === 0)
       throw new Error("paths 为空或不是数组");
     const results: string[] = [];
     for (const raw of arr) {
-      const p = String(raw ?? "").trim();
+      const item = typeof raw === "string" ? { path: raw } : raw;
+      const p = String(item.path ?? "").trim();
       if (!p) { results.push(`⚠️ 跳过空路径`); continue; }
+      const start = Math.max(0, (Number(item.offset) || 1) - 1);
+      const rawLimit = Number(item.limit);
+      const max = rawLimit === -1 ? Infinity : (rawLimit || 2000);
       try {
         const content = await readFile(p, "utf8");
         const lines = content.split("\n");
-        const shown = lines.slice(0, 400);
-        const body = shown.map((l, i) => `${i + 1}\t${l}`).join("\n");
-        const more = lines.length > shown.length ? `\n…(共 ${lines.length} 行，省略其余)` : "";
-        results.push(`=== ${p} ===\n${body + more || "(空文件)"}`);
+        const shown = lines.slice(start, start + max);
+        const body = shown.map((_, i) => `${start + i + 1}\t${shown[i]}`).join("\n");
+        const more =
+          lines.length > start + shown.length
+            ? `\n…(共 ${lines.length} 行，省略其余)`
+            : "";
+        const prefix = start > 0 ? `…(跳过前 ${start} 行)\n` : "";
+        results.push(`=== ${p} ===\n${prefix + body + more || "(空文件)"}`);
       } catch (e) {
         results.push(`=== ${p} ===\n❌ 读取失败: ${e instanceof Error ? e.message : String(e)}`);
       }

@@ -208,6 +208,18 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
     ],
     internalCfg(cfg, "summarizeChunk")
   );
+  // 内部调用也要上报 token 用量，否则 UI 计费漏算
+  // 所有字段优先从 usage_metadata 取，rawUsage 仅做回退
+  {
+    const rawU = (res.response_metadata as { usage?: Record<string, number> }).usage;
+    const rum = res.usage_metadata as Record<string, number> | undefined;
+    emit({ type: "usage",
+      promptTokens: res.usage_metadata?.input_tokens ?? rawU?.prompt_tokens ?? 0,
+      completionTokens: res.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
+      cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
+      cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
+      timestamp: new Date().toISOString() });
+  }
   const { summary, facts } = parseSummary(lcText(res));
   applyCompaction(scratch, range, summary);
   for (const f of facts) if (!scratch.memory.includes(f)) scratch.memory.push(f);
@@ -237,6 +249,17 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
       internalCfg(cfg, "summarizeTexts")
     );
     applyFold(scratch, group, lcText(folded).trim() || texts.join(" / "));
+    // 内部 fold 调用也要上报 token
+    {
+      const rawU = (folded.response_metadata as { usage?: Record<string, number> }).usage;
+      const rum = folded.usage_metadata as Record<string, number> | undefined;
+      emit({ type: "usage",
+        promptTokens: folded.usage_metadata?.input_tokens ?? rawU?.prompt_tokens ?? 0,
+        completionTokens: folded.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
+        cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
+        cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
+        timestamp: new Date().toISOString() });
+    }
     logger.section(`🗜🗜 二级折叠 摘要段[${group[0]}..${group[1]}]`);
     emit({
       type: "note",
@@ -290,6 +313,8 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
   let acc: AIMessageChunk | null = null;
   let reasoning = "";
   let content = "";
+  // 截获最后一片带 usage 的 chunk 的原始数据——累加前取值，避开 concat 翻倍
+  let lastChunkUsage: Record<string, number> | undefined;
   for await (const chunk of stream) {
     const r = (chunk.additional_kwargs as { reasoning_content?: string } | undefined)
       ?.reasoning_content;
@@ -301,6 +326,9 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
       content += chunk.content;
       emit({ type: "assistant", text: chunk.content });
     }
+    // 在 concat 之前，先从原始 chunk 取 usage（单片的，不翻倍）
+    const chunkUsage = (chunk.response_metadata as { usage?: Record<string, number> } | undefined)?.usage;
+    if (chunkUsage?.prompt_tokens) lastChunkUsage = chunkUsage;
     acc = acc ? acc.concat(chunk) : chunk;
   }
 
@@ -320,20 +348,22 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
   if (aiMsg.tool_calls?.length)
     logger.log(`[拼好的 tool_calls]\n${JSON.stringify(aiMsg.tool_calls, null, 2)}`);
 
-  const inTok = acc?.usage_metadata?.input_tokens ?? 0;
-  const outTok = acc?.usage_metadata?.output_tokens ?? 0;
-  // DeepSeek 特有字段：prompt_cache_hit_tokens / prompt_cache_miss_tokens
-  // 不在 LangChain 标准 UsageMetadata 类型里，但运行时存在
-  const um = acc?.usage_metadata as Record<string, number> | undefined;
-  const cacheHit = um?.prompt_cache_hit_tokens ?? 0;
-  const cacheMiss = um?.prompt_cache_miss_tokens ?? 0;
-  if (inTok > 0) {
+  // 所有 token 字段优先从 lastChunkUsage 取（累加前的原始值，不翻倍），
+  // 其次回退到 usage_metadata（标准字段可靠），最后用 response_metadata.usage。
+  const um = acc?.usage_metadata;
+  const rum = um as Record<string, number> | undefined;
+  const rawUsage = (aiMsg.response_metadata as { usage?: Record<string, number> }).usage;
+  const inTok = lastChunkUsage?.prompt_tokens ?? um?.input_tokens ?? rawUsage?.prompt_tokens ?? 0;
+  const outTok = lastChunkUsage?.completion_tokens ?? um?.output_tokens ?? rawUsage?.completion_tokens ?? 0;
+  const cacheHit = lastChunkUsage?.prompt_cache_hit_tokens ?? rum?.prompt_cache_hit_tokens ?? rawUsage?.prompt_cache_hit_tokens ?? 0;
+  const cacheMiss = lastChunkUsage?.prompt_cache_miss_tokens ?? rum?.prompt_cache_miss_tokens ?? rawUsage?.prompt_cache_miss_tokens ?? 0;
+  if (inTok > 0 || cacheHit > 0 || cacheMiss > 0) {
     emit({ type: "usage", promptTokens: inTok, completionTokens: outTok,
       cacheHitTokens: cacheHit, cacheMissTokens: cacheMiss,
       timestamp: new Date().toISOString() });
     emit({
       type: "debug",
-      text: `📊 token: prompt=${inTok} completion=${acc?.usage_metadata?.output_tokens ?? "?"} `
+      text: `📊 token: prompt=${inTok} completion=${outTok} `
         + `cache_hit=${cacheHit} cache_miss=${cacheMiss} finish_reason=${
         (aiMsg.response_metadata as { finish_reason?: string }).finish_reason ?? "?"
       }`,
@@ -378,6 +408,17 @@ async function judgeNode(state: GState, cfg: LangGraphRunnableConfig) {
           internalCfg(cfg, "judgeRisk")
         );
         const { risky, reason } = parseRisk(lcText(res));
+        // 内部判风险调用也要上报 token
+        {
+          const rawU = (res.response_metadata as { usage?: Record<string, number> }).usage;
+          const rum = res.usage_metadata as Record<string, number> | undefined;
+          emit({ type: "usage",
+            promptTokens: res.usage_metadata?.input_tokens ?? rawU?.prompt_tokens ?? 0,
+            completionTokens: res.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
+            cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
+            cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
+            timestamp: new Date().toISOString() });
+        }
         if (risky) risks.push({ id, reason: `模型判定：${reason}` });
         else emit({ type: "note", text: `✓ 自动放行 ${tc.name}（低风险：${reason}）` });
       } catch {

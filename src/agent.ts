@@ -243,6 +243,7 @@ function renderTranscript(slice: Message[]): string {
  */
 async function summarizeChunk(
   slice: Message[],
+  emit: Emitter,
   signal?: AbortSignal
 ): Promise<{ summary: string; facts: string[] }> {
   const res = await client.chat.completions.create({
@@ -252,6 +253,11 @@ async function summarizeChunk(
       { role: "user", content: "对话片段：\n\n" + renderTranscript(slice) },
     ],
   }, { signal }); // 接中断信号：Ctrl+C 时内部 LLM 调用也随之取消
+  // 内部调用也要上报 token 用量，否则 UI 计费漏算
+  if (res.usage) {
+    const u = res.usage as unknown as Record<string, number>;
+    emit({ type: "usage", promptTokens: res.usage.prompt_tokens, completionTokens: res.usage.completion_tokens, cacheHitTokens: u.prompt_cache_hit_tokens, cacheMissTokens: u.prompt_cache_miss_tokens, timestamp: new Date().toISOString() });
+  }
   return parseSummary(res.choices[0]?.message?.content ?? "");
 }
 
@@ -262,6 +268,7 @@ async function summarizeChunk(
 async function judgeRisk(
   name: string,
   args: Record<string, unknown>,
+  emit: Emitter,
   signal?: AbortSignal
 ): Promise<{ risky: boolean; reason: string }> {
   try {
@@ -272,6 +279,11 @@ async function judgeRisk(
         { role: "user", content: `工具: ${name}\n参数: ${JSON.stringify(args)}` },
       ],
     }, { signal });
+    // 内部调用也要上报 token 用量
+    if (res.usage) {
+      const u = res.usage as unknown as Record<string, number>;
+      emit({ type: "usage", promptTokens: res.usage.prompt_tokens, completionTokens: res.usage.completion_tokens, cacheHitTokens: u.prompt_cache_hit_tokens, cacheMissTokens: u.prompt_cache_miss_tokens, timestamp: new Date().toISOString() });
+    }
     return parseRisk(res.choices[0]?.message?.content ?? "");
   } catch {
     return { risky: true, reason: "风险判定失败，保守起见需确认" };
@@ -279,7 +291,7 @@ async function judgeRisk(
 }
 
 /** 把若干旧摘要再合并浓缩成更高层级的一条（分级折叠的那次 LLM 调用）。 */
-async function summarizeTexts(texts: string[], signal?: AbortSignal): Promise<string> {
+async function summarizeTexts(texts: string[], emit: Emitter, signal?: AbortSignal): Promise<string> {
   const res = await client.chat.completions.create({
     model: MODEL,
     messages: [
@@ -290,6 +302,11 @@ async function summarizeTexts(texts: string[], signal?: AbortSignal): Promise<st
       },
     ],
   }, { signal });
+  // 内部调用也要上报 token 用量
+  if (res.usage) {
+    const u = res.usage as unknown as Record<string, number>;
+    emit({ type: "usage", promptTokens: res.usage.prompt_tokens, completionTokens: res.usage.completion_tokens, cacheHitTokens: u.prompt_cache_hit_tokens, cacheMissTokens: u.prompt_cache_miss_tokens, timestamp: new Date().toISOString() });
+  }
   return res.choices[0]?.message?.content?.trim() || texts.join(" / ");
 }
 
@@ -303,7 +320,7 @@ async function maybeFold(
     const group = pickFoldGroup(session);
     if (!group) break;
     const texts = session.summaries.slice(group[0], group[1] + 1).map((x) => x.text);
-    const text = await summarizeTexts(texts, signal);
+    const text = await summarizeTexts(texts, emit, signal);
     applyFold(session, group, text);
     session.logger.section(`🗜🗜 二级折叠 摘要段[${group[0]}..${group[1]}]`);
     session.logger.log(text);
@@ -335,7 +352,7 @@ async function maybeCompact(
     type: "debug",
     text: `🗜 折叠 messages[${range[0]}..${range[1]}]（${slice.length} 条）成摘要 …`,
   });
-  const { summary, facts } = await summarizeChunk(slice, signal);
+  const { summary, facts } = await summarizeChunk(slice, emit, signal);
   applyCompaction(session, range, summary);
   for (const f of facts)
     if (!session.memory.includes(f)) session.memory.push(f); // 外置记忆去重追加
@@ -500,7 +517,7 @@ export async function runAgent(
             riskReason[i] = `规则判定：${rule}`;
             return;
           }
-          const { risky, reason } = await judgeRisk(name, parsed[i]!, signal);
+          const { risky, reason } = await judgeRisk(name, parsed[i]!, emit, signal);
           needConfirm[i] = risky;
           riskReason[i] = risky ? `模型判定：${reason}` : "";
           if (!risky)
