@@ -17,7 +17,7 @@ import {
 } from "./skill.js";
 import { loadGlobalMemory } from "./store.js";
 import { contextReport } from "./compress.js";
-import { describeToolBrief } from "./tools.js";
+import { describeToolBrief, pureTools } from "./tools.js";
 import { config } from "./config.js";
 import { calcCost, formatCost, peakLabel } from "./billing.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
@@ -73,7 +73,7 @@ const TODO_ICON: Record<Todo["status"], string> = {
 // 把一条 Item 摊成「带样式的行」（Line=Span[]），便于做行级滚动窗口。
 // assistant 内容走 markdown 渲染；其余纯文本套基础样式。
 
-/** 比较新旧文本，返回着色行：删除行红色，增加行绿色。 */
+/** 比较新旧文本，返回着色行：上下文白色，删除行红色，增加行绿色。前后各留 3 行上下文。 */
 function coloredDiff(oldText: string, newText: string, max = 16): Line[] {
   const a = oldText.split("\n");
   const b = newText.split("\n");
@@ -83,9 +83,27 @@ function coloredDiff(oldText: string, newText: string, max = 16): Line[] {
   let eb = b.length;
   while (ea > p && eb > p && a[ea - 1] === b[eb - 1]) (ea--, eb--);
 
+  const ctx = 3;
+  const preCtx = Math.max(0, p - ctx);
+  const postCtxA = Math.min(a.length, ea + ctx);
+  const postCtxB = Math.min(b.length, eb + ctx);
+
+  const ln = (n: number) => String(n + 1).padStart(4); // 1-based 行号
   const lines: Line[] = [];
-  for (const l of a.slice(p, ea)) lines.push([{ text: `  - ${l}`, color: "red" }]);
-  for (const l of b.slice(p, eb)) lines.push([{ text: `  + ${l}`, color: "green" }]);
+  // 上文（白色）
+  if (preCtx < p) {
+    for (let i = preCtx; i < p; i++) lines.push([{ text: `    ${ln(i)} ${a[i]}` }]);
+    lines.push([{ text: "  …", dim: true }]);
+  }
+  // 删除行（红色）
+  for (let i = p; i < ea; i++) lines.push([{ text: `  - ${ln(i)} ${a[i]}`, color: "red" }]);
+  // 增加行（绿色）
+  for (let i = p; i < eb; i++) lines.push([{ text: `  + ${ln(i)} ${b[i]}`, color: "green" }]);
+  // 下文（白色）
+  if (ea < postCtxA) {
+    lines.push([{ text: "  …", dim: true }]);
+    for (let i = ea; i < postCtxA; i++) lines.push([{ text: `    ${ln(i)} ${a[i]}` }]);
+  }
 
   if (lines.length === 0) return [[{ text: "  (无变化)", dim: true }]];
   if (lines.length > max) {
@@ -136,7 +154,7 @@ function itemLines(it: Item, width: number): Line[] {
     }
     case "tool_call": {
       const lines: Line[] = [];
-      lines.push([{ text: `🔧 ${it.name}`, color: "yellow" }]);
+      lines.push([{ text: `🔧 ${it.name}`, color: it.name in pureTools ? "green" : "yellow" }]);
       if (it.argsText) {
         try {
           const args = JSON.parse(it.argsText);
@@ -303,12 +321,12 @@ function App({ session }: { session: Session }) {
   const [streaming, setStreaming] = useState("");
   const [busy, setBusy] = useState(false);
   const [ctxTokens, setCtxTokens] = useState(() => session.lastPromptTokens); // 当前上下文 token
-  const [outputTokens, setOutputTokens] = useState(0); // 累积输出 token
-  const [inputTokens, setInputTokens] = useState(0); // 累积输入 token（prompt）
-  const [cacheMissTokens, setCacheMissTokens] = useState(0); // 累积缓存未命中 token
-  const [cacheHitTokens, setCacheHitTokens] = useState(0); // 累积缓存命中 token
-  const [requestCount, setRequestCount] = useState(0); // 已发请求次数
-  const [totalCost, setTotalCost] = useState(0); // 累积费用（按每笔请求的真实时间戳计价）
+  const [outputTokens, setOutputTokens] = useState(() => session.outputTokens); // 累积输出 token
+  const [inputTokens, setInputTokens] = useState(() => session.inputTokens); // 累积输入 token（prompt）
+  const [cacheMissTokens, setCacheMissTokens] = useState(() => session.cacheMissTokens); // 累积缓存未命中 token
+  const [cacheHitTokens, setCacheHitTokens] = useState(() => session.cacheHitTokens); // 累积缓存命中 token
+  const [requestCount, setRequestCount] = useState(() => session.requestCount); // 已发请求次数
+  const [totalCost, setTotalCost] = useState(() => session.totalCost); // 累积费用（按每笔请求的真实时间戳计价）
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
@@ -342,12 +360,12 @@ function App({ session }: { session: Session }) {
       adoptSession(session, ns);
       setPicker(null);
       setCtxTokens(ns.lastPromptTokens); // ctx 占比切到目标会话
-      setInputTokens(0); // 新会话输入 token 从零开始
-      setOutputTokens(0); // 新会话输出 token 从零开始
-      setCacheMissTokens(0); // 新会话缓存 token 从零开始
-      setCacheHitTokens(0);
-      setRequestCount(0); // 请求次数从零开始
-      setTotalCost(0); // 累积费用重置
+      setInputTokens(ns.inputTokens);
+      setOutputTokens(ns.outputTokens);
+      setCacheMissTokens(ns.cacheMissTokens);
+      setCacheHitTokens(ns.cacheHitTokens);
+      setRequestCount(ns.requestCount);
+      setTotalCost(ns.totalCost);
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
@@ -539,9 +557,17 @@ function App({ session }: { session: Session }) {
           if (cm != null) setCacheMissTokens((n) => n + cm);
           setRequestCount((n) => n + 1); // 请求计数
           // 按本次请求的真实时间戳累加费用（而非最后一次性用「此刻」算）
-          setTotalCost((n) => n + calcCost(config.model,
+          const thisCost = calcCost(config.model,
             ev.cacheMissTokens ?? 0, ev.cacheHitTokens ?? 0,
-            ev.completionTokens, ev.timestamp));
+            ev.completionTokens, ev.timestamp);
+          setTotalCost((n) => n + thisCost);
+          // 同步回 session（持久化，隔次恢复不丢）
+          session.inputTokens += ev.promptTokens;
+          session.outputTokens += ev.completionTokens;
+          if (ch != null) session.cacheHitTokens += ch;
+          if (cm != null) session.cacheMissTokens += cm;
+          session.requestCount += 1;
+          session.totalCost += thisCost;
         } else if (ev.type === "note") {
           push({ kind: "note", text: ev.text }); // 如「已折叠」提示
         } else if (ev.type === "todos") {
@@ -589,6 +615,7 @@ function App({ session }: { session: Session }) {
   cursorRef.current = cursor;
   const busyRef = useRef(busy);
   busyRef.current = busy;
+  const pasteRef = useRef(false); // bracketed paste 模式：粘贴中
   const submitRef = useRef(onSubmit);
   submitRef.current = onSubmit;
   const historyRef = useRef(history);
@@ -604,7 +631,7 @@ function App({ session }: { session: Session }) {
   // 被当成「打字」塞进输入框。同时开启鼠标上报、统一处理滚轮 + 键盘。
   useEffect(() => {
     if (isRawModeSupported) setRawMode(true);
-    stdout.write("\x1b[?1000h\x1b[?1006h"); // 开启鼠标上报（SGR）
+    stdout.write("\x1b[?1000h\x1b[?1006h\x1b[?2004h"); // 开启鼠标上报（SGR）+ bracketed paste
     const onData = (buf: Buffer) => {
       let s = buf.toString("utf8");
 
@@ -705,22 +732,28 @@ function App({ session }: { session: Session }) {
         const rest = s.slice(i);
         if (rest[0] === "\x1b") {
           if (rest.startsWith("\x1b[A")) {
-            if (inp.includes("\n")) {
-              const { row, col } = cursorToRowCol(inp, cur);
-              cur = rowColToCursor(inp, row - 1, col);
-              touched = true;
-            } else histNav(-1);
+            // ↑：始终走历史浏览，多行时不移动光标行
+            histNav(-1);
             i += 3;
           } else if (rest.startsWith("\x1b[B")) {
-            if (inp.includes("\n")) {
-              const { row, col } = cursorToRowCol(inp, cur);
-              cur = rowColToCursor(inp, row + 1, col);
-              touched = true;
-            } else histNav(1);
+            // ↓：始终走历史浏览
+            histNav(1);
             i += 3;
           }
-          else if (rest.startsWith("\x1b[C")) ((cur = Math.min(inp.length, cur + 1)), (touched = true), (i += 3)); // →
-          else if (rest.startsWith("\x1b[D")) ((cur = Math.max(0, cur - 1)), (touched = true), (i += 3)); // ←
+          else if (rest.startsWith("\x1b[C")) {
+            // → 跳过 \n：光标不能在换行符上
+            cur = Math.min(inp.length, cur + 1);
+            while (cur < inp.length && inp[cur] === "\n") cur++;
+            touched = true;
+            i += 3;
+          }
+          else if (rest.startsWith("\x1b[D")) {
+            // ← 跳过 \n
+            cur = Math.max(0, cur - 1);
+            while (cur > 0 && inp[cur] === "\n") cur--;
+            touched = true;
+            i += 3;
+          }
           else if (rest.startsWith("\x1b[H")) {
             if (inp.includes("\n")) {
               const { row } = cursorToRowCol(inp, cur);
@@ -736,8 +769,20 @@ function App({ session }: { session: Session }) {
             } else cur = inp.length;
             touched = true;
             i += 3;
-          }
-          else {
+          } else if (rest.startsWith("\x1b\r")) {
+            // Alt+Enter：始终插入换行
+            inp = inp.slice(0, cur) + "\n" + inp.slice(cur);
+            cur += 1;
+            touched = true;
+            i += 2;
+          } else if (rest.startsWith("\x1b[200~")) {
+            // bracketed paste 开始：后续 \n/\r 当换行而非提交
+            pasteRef.current = true;
+            i += 6;
+          } else if (rest.startsWith("\x1b[201~")) {
+            pasteRef.current = false;
+            i += 6;
+          } else {
             const m = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(rest);
             if (m) i += m[0].length; // 其它 CSI：跳过
             else {
@@ -752,23 +797,26 @@ function App({ session }: { session: Session }) {
         const ch = rest[0]!;
         const code = ch.codePointAt(0)!;
         if (ch === "\r") {
-          if (inp.includes("\n")) {
-            // 多行输入：Enter 插入换行
+          if (pasteRef.current) {
+            // 粘贴中：\r 插入换行（\r\n 只插一个）
+            if (rest[1] === "\n") i += 1; // 跳过后续 \n
             inp = inp.slice(0, cur) + "\n" + inp.slice(cur);
             cur += 1;
+            touched = true;
           } else {
-            // 单行输入：Enter 提交（兼容既有行为）
+            // Enter 发送请求
             submitRef.current(inp);
             inp = "";
             cur = 0;
+            touched = true;
           }
-          touched = true;
         } else if (ch === "\n") {
-          // Ctrl+J：始终提交（多行输入时用）
-          submitRef.current(inp);
-          inp = "";
-          cur = 0;
-          touched = true;
+          // 粘贴中的 \n：插入换行（bare \n）；非粘贴时直接忽略（不使用 Ctrl+J）
+          if (pasteRef.current) {
+            inp = inp.slice(0, cur) + "\n" + inp.slice(cur);
+            cur += 1;
+            touched = true;
+          }
         } else if (code === 127 || code === 8) {
           if (cur > 0) {
             inp = inp.slice(0, cur - 1) + inp.slice(cur); // 删光标前一个字
@@ -786,6 +834,25 @@ function App({ session }: { session: Session }) {
             cur = inp.length;
             touched = true;
           }
+        } else if (code === 1) {
+          // Ctrl+A：跳到行首
+          if (inp.includes("\n")) {
+            const { row } = cursorToRowCol(inp, cur);
+            cur = rowColToCursor(inp, row, 0);
+          } else {
+            cur = 0;
+          }
+          touched = true;
+        } else if (code === 5) {
+          // Ctrl+E：跳到行尾
+          if (inp.includes("\n")) {
+            const { row } = cursorToRowCol(inp, cur);
+            const { lines } = inputLineStarts(inp);
+            cur = rowColToCursor(inp, row, lines[row]!.length);
+          } else {
+            cur = inp.length;
+          }
+          touched = true;
         } else if (code >= 32) {
           inp = inp.slice(0, cur) + ch + inp.slice(cur); // 在光标处插入
           cur += ch.length;
@@ -801,7 +868,7 @@ function App({ session }: { session: Session }) {
     process.stdin.on("data", onData);
     return () => {
       process.stdin.off("data", onData);
-      stdout.write("\x1b[?1000l\x1b[?1006l");
+      stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?2004l");
       if (isRawModeSupported) setRawMode(false);
     };
   }, [stdout, setRawMode, isRawModeSupported, exit]);
@@ -986,7 +1053,7 @@ function App({ session }: { session: Session }) {
 
           {/* 多行输入框（默认 10 行）；光标支持 ←→↑↓ 移动 */}
           {input.includes("\n") && !busy ? (
-            <Text dimColor>Ctrl+J 提交 · Enter 换行</Text>
+            <Text dimColor>Ctrl+J 提交 · Enter/Alt+Enter 换行</Text>
           ) : null}
           <Box flexDirection="column">
             {allInputLines.length === 0 ? (

@@ -31,6 +31,13 @@ export interface SessionMeta {
 export interface StoredSession extends SessionMeta {
   messages: Message[];
   lastPromptTokens?: number; // 上轮投影大小；恢复后据此立刻判断是否要裁
+  // —— 累积 token / 费用统计（所有字段可选，兼容旧存档）——
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
+  totalCost?: number;
+  requestCount?: number;
   // —— 压缩状态（贵的产物缓存进 JSON → 恢复零重放）——
   summaries?: SummarySegment[];
   summarizedUpTo?: number;

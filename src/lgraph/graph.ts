@@ -56,6 +56,7 @@ import {
   parseRisk,
   parseSummary,
 } from "../llmtasks.js";
+import { FLASH_MODEL } from "../llm.js";
 import { lcOps, lcText, renderTranscriptLC } from "./messages.js";
 
 // —— 状态通道：messages 用官方 reducer（append 语义 = 我们的「真相源只增」原则），
@@ -163,6 +164,19 @@ function model(): ChatDeepSeek {
   return _model;
 }
 
+/** 内部辅助调用（风险判断/摘要/折叠）用的轻量模型，降成本。 */
+let _flashModel: ChatDeepSeek | null = null;
+function flashModel(): ChatDeepSeek {
+  if (!_flashModel) {
+    _flashModel = new ChatDeepSeek({
+      model: FLASH_MODEL,
+      apiKey: process.env.DEEPSEEK_API_KEY,
+      ...(config.traceStream ? { configuration: { fetch: traceFetch } } : {}),
+    });
+  }
+  return _flashModel;
+}
+
 const timeline = (ms: BaseMessage[]) =>
   ms
     .map((m) => {
@@ -201,7 +215,7 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
     type: "debug",
     text: `🗜 折叠 messages[${range[0]}..${range[1]}]（${slice.length} 条）成摘要 …`,
   });
-  const res = await model().invoke(
+  const res = await flashModel().invoke(
     [
       { role: "system", content: SUMMARIZE_SYSTEM },
       { role: "user", content: "对话片段：\n\n" + renderTranscriptLC(slice) },
@@ -241,7 +255,7 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
     const group = pickFoldGroup(scratch);
     if (!group) break;
     const texts = scratch.summaries.slice(group[0], group[1] + 1).map((x) => x.text);
-    const folded = await model().invoke(
+    const folded = await flashModel().invoke(
       [
         { role: "system", content: FOLD_SYSTEM },
         { role: "user", content: texts.map((t, i) => `[摘要${i + 1}]\n${t}`).join("\n\n") },
@@ -400,7 +414,7 @@ async function judgeNode(state: GState, cfg: LangGraphRunnableConfig) {
         return;
       }
       try {
-        const res = await model().invoke(
+        const res = await flashModel().invoke(
           [
             { role: "system", content: RISK_JUDGE_SYSTEM },
             { role: "user", content: `工具: ${tc.name}\n参数: ${JSON.stringify(tc.args)}` },

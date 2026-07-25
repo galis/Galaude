@@ -1,5 +1,5 @@
 import type OpenAI from "openai";
-import { client, MODEL } from "./llm.js";
+import { client, MODEL, FLASH_MODEL } from "./llm.js";
 import {
   toolSchemas,
   pureTools,
@@ -247,7 +247,7 @@ async function summarizeChunk(
   signal?: AbortSignal
 ): Promise<{ summary: string; facts: string[] }> {
   const res = await client.chat.completions.create({
-    model: MODEL,
+    model: FLASH_MODEL,
     messages: [
       { role: "system", content: SUMMARIZE_SYSTEM }, // 提示词与解析在 llmtasks.ts，两引擎共用
       { role: "user", content: "对话片段：\n\n" + renderTranscript(slice) },
@@ -273,7 +273,7 @@ async function judgeRisk(
 ): Promise<{ risky: boolean; reason: string }> {
   try {
     const res = await client.chat.completions.create({
-      model: MODEL,
+      model: FLASH_MODEL,
       messages: [
         { role: "system", content: RISK_JUDGE_SYSTEM }, // 提示词与解析在 llmtasks.ts，两引擎共用
         { role: "user", content: `工具: ${name}\n参数: ${JSON.stringify(args)}` },
@@ -293,7 +293,7 @@ async function judgeRisk(
 /** 把若干旧摘要再合并浓缩成更高层级的一条（分级折叠的那次 LLM 调用）。 */
 async function summarizeTexts(texts: string[], emit: Emitter, signal?: AbortSignal): Promise<string> {
   const res = await client.chat.completions.create({
-    model: MODEL,
+    model: FLASH_MODEL,
     messages: [
       { role: "system", content: FOLD_SYSTEM }, // 提示词在 llmtasks.ts，两引擎共用
       {

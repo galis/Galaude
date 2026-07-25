@@ -20,3 +20,5 @@ export const client = new OpenAI({
 });
 
 export const MODEL = config.model;
+/** 内部辅助调用（风险判断/摘要/折叠）用的轻量模型（env: FLASH_MODEL） */
+export const FLASH_MODEL = process.env.FLASH_MODEL ?? "deepseek-v4-flash";

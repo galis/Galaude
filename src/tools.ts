@@ -51,8 +51,7 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         "在本机执行一条 bash 命令并返回输出（stdout+stderr+退出码）。" +
         "适合看目录、查日期/系统信息、跑构建/测试/git 等命令行工具。" +
         "例如 'ls -la'、'date'、'npm test'、'git status'。" +
-        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。" +
-        "多条独立命令用 batch_run_bash 一次并发执行。",
+        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。",
       parameters: {
         type: "object",
         properties: {
@@ -205,122 +204,14 @@ export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       },
     },
   },
-  {
-    type: "function",
-    function: {
-      name: "batch_read_file",
-      description:
-        "一次读取多个文本文件内容（每个文件带行号返回）。" +
-        "需要同时查看多个文件时优先使用，避免多次调用 read_file。" +
-        "每个文件最多返回 400 行，超大文件会截断并标注。",
-      parameters: {
-        type: "object",
-        properties: {
-          paths: {
-            type: "array",
-            description: "要读取的文件路径列表（相对或绝对）",
-            items: { type: "string" },
-          },
-        },
-        required: ["paths"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "batch_write_file",
-      description:
-        "一次写入/覆盖多个文件（父目录须已存在；文件不存在则新建）。" +
-        "需要同时创建或覆盖多个文件时优先使用，避免多次调用 write_file。",
-      parameters: {
-        type: "object",
-        properties: {
-          files: {
-            type: "array",
-            description: "要写入的文件列表",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string", description: "文件路径" },
-                content: { type: "string", description: "要写入的完整内容" },
-              },
-              required: ["path", "content"],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ["files"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "batch_edit_file",
-      description:
-        "一次对多个文件做精确编辑：每个编辑中 old_string 在对应文件中「唯一一次」出现替换成 new_string。" +
-        "old_string 必须逐字匹配（含缩进与换行），且在文件中唯一。" +
-        "需要同时修改多个文件时优先使用，避免多次调用 edit_file。",
-      parameters: {
-        type: "object",
-        properties: {
-          edits: {
-            type: "array",
-            description: "要执行的编辑列表",
-            items: {
-              type: "object",
-              properties: {
-                path: { type: "string", description: "文件路径" },
-                old_string: { type: "string", description: "要被替换的原文（需唯一）" },
-                new_string: { type: "string", description: "替换成的新内容" },
-              },
-              required: ["path", "old_string", "new_string"],
-              additionalProperties: false,
-            },
-          },
-        },
-        required: ["edits"],
-        additionalProperties: false,
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "batch_run_bash",
-      description:
-        "一次执行多条独立的 bash 命令并返回各自的输出（stdout+stderr+退出码）。" +
-        "多条命令间无依赖时可并发执行，比逐条调用 run_bash 更快。" +
-        "例如同时查看多个目录、同时检查多个文件状态。" +
-        "⚠️ 读/写/改文件内容请用 read_file/write_file/edit_file，不要用 cat/echo/sed。",
-      parameters: {
-        type: "object",
-        properties: {
-          commands: {
-            type: "array",
-            description: "要执行的 bash 命令列表，例如 ['ls -la', 'git status', 'date']",
-            items: { type: "string" },
-          },
-        },
-        required: ["commands"],
-        additionalProperties: false,
-      },
-    },
-  },
 ];
 
 // 需要先经用户确认才执行的「危险」工具（有副作用 / 能跑任意命令）。
 // read_file / calculate 只读或纯计算，无副作用，不需要确认。
 export const needsApproval = new Set<string>([
   "run_bash",
-  "batch_run_bash",
   "write_file",
   "edit_file",
-  "batch_write_file",
-  "batch_edit_file",
 ]);
 
 // —— 确定性风险规则（auto 模式的第一道闸）——
@@ -329,7 +220,6 @@ export const needsApproval = new Set<string>([
 const BASH_RISK_RULES: [RegExp, string][] = [
   [/\brm\b/, "删除文件（rm）"],
   [/\bsudo\b/, "提权（sudo）"],
-  [/(^|\s)\d?>{1,2}\s*[^&\s]/, "输出重定向写文件（>/>>）"],
   [/\|\s*(ba|z|da)?sh\b/, "管道进 shell 执行（curl|sh 类）"],
   [/\b(curl|wget)\b/, "外联下载"],
   [/\bdd\b/, "dd 底层写盘"],
@@ -347,13 +237,10 @@ export function ruleRisk(
   name: string,
   args: Record<string, unknown>
 ): string | null {
-  if (name === "run_bash" || name === "batch_run_bash") {
-    const cmds = name === "batch_run_bash"
-      ? (args.commands as string[] ?? [])
-      : [String(args.command ?? "")];
-    for (const cmd of cmds)
-      for (const [re, why] of BASH_RISK_RULES)
-        if (re.test(cmd)) return `${name === "batch_run_bash" ? "批量命令: " : ""}${why}`;
+  if (name === "run_bash") {
+    const cmd = String(args.command ?? "");
+    for (const [re, why] of BASH_RISK_RULES)
+      if (re.test(cmd)) return why;
     return null;
   }
   if (name === "write_file" || name === "edit_file") {
@@ -361,28 +248,6 @@ export function ruleRisk(
     const cwd = process.cwd();
     if (p !== cwd && !p.startsWith(cwd + sep))
       return `写工作目录（${cwd}）之外的路径`;
-    return null;
-  }
-  if (name === "batch_write_file") {
-    const files = args.files as { path?: string }[] | undefined;
-    if (!Array.isArray(files)) return null;
-    const cwd = process.cwd();
-    for (const f of files) {
-      const p = resolve(String(f.path ?? ""));
-      if (p !== cwd && !p.startsWith(cwd + sep))
-        return `批量写入含工作目录（${cwd}）之外的路径: ${f.path}`;
-    }
-    return null;
-  }
-  if (name === "batch_edit_file") {
-    const edits = args.edits as { path?: string }[] | undefined;
-    if (!Array.isArray(edits)) return null;
-    const cwd = process.cwd();
-    for (const e of edits) {
-      const p = resolve(String(e.path ?? ""));
-      if (p !== cwd && !p.startsWith(cwd + sep))
-        return `批量编辑含工作目录（${cwd}）之外的路径: ${e.path}`;
-    }
     return null;
   }
   return null;
@@ -453,39 +318,6 @@ export const pureTools: Record<string, ToolImpl> = {
     }
   },
 
-  async batch_run_bash({ commands }) {
-    const arr = commands as string[] | undefined;
-    if (!Array.isArray(arr) || arr.length === 0)
-      throw new Error("commands 为空或不是数组");
-    const clip = (s: string) =>
-      s.length > 2000 ? s.slice(0, 2000) + "\n…(输出已截断)" : s;
-    const runOne = async (cmd: string, i: number) => {
-      const c = cmd.trim();
-      if (!c) return `[${i}] (空命令)`;
-      try {
-        const { stdout, stderr } = await execFileAsync("bash", ["-c", c], {
-          encoding: "utf8",
-          timeout: config.bashTimeoutMs,
-          maxBuffer: 1024 * 1024,
-        });
-        return `[${i}] exit=0\n${clip(`${stdout}${stderr}`) || "(无输出)"}`;
-      } catch (e) {
-        const err = e as {
-          code?: number | string;
-          signal?: string;
-          stdout?: string;
-          stderr?: string;
-          message?: string;
-        };
-        const out = clip(`${err.stdout ?? ""}${err.stderr ?? ""}`);
-        const status = err.signal ?? err.code ?? "?";
-        return `[${i}] exit=${status}\n${out || err.message || "(出错)"}`;
-      }
-    };
-    const results = await Promise.all(arr.map((cmd, i) => runOne(String(cmd ?? ""), i + 1)));
-    return results.join("\n\n");
-  },
-
   async read_file({ path, offset, limit }) {
     const p = String(path ?? "").trim();
     if (!p) throw new Error("path 为空");
@@ -528,85 +360,6 @@ export const pureTools: Record<string, ToolImpl> = {
     return `已编辑 ${p}（替换 1 处）`;
   },
 
-  async batch_read_file({ paths }) {
-    const arr = paths as (string | { path?: string; offset?: number; limit?: number })[] | undefined;
-    if (!Array.isArray(arr) || arr.length === 0)
-      throw new Error("paths 为空或不是数组");
-    const results: string[] = [];
-    for (const raw of arr) {
-      const item = typeof raw === "string" ? { path: raw } : raw;
-      const p = String(item.path ?? "").trim();
-      if (!p) { results.push(`⚠️ 跳过空路径`); continue; }
-      const start = Math.max(0, (Number(item.offset) || 1) - 1);
-      const rawLimit = Number(item.limit);
-      const max = rawLimit === -1 ? Infinity : (rawLimit || 2000);
-      try {
-        const content = await readFile(p, "utf8");
-        const lines = content.split("\n");
-        const shown = lines.slice(start, start + max);
-        const body = shown.map((_, i) => `${start + i + 1}\t${shown[i]}`).join("\n");
-        const more =
-          lines.length > start + shown.length
-            ? `\n…(共 ${lines.length} 行，省略其余)`
-            : "";
-        const prefix = start > 0 ? `…(跳过前 ${start} 行)\n` : "";
-        results.push(`=== ${p} ===\n${prefix + body + more || "(空文件)"}`);
-      } catch (e) {
-        results.push(`=== ${p} ===\n❌ 读取失败: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-    return results.join("\n\n");
-  },
-
-  async batch_write_file({ files }) {
-    const arr = files as { path?: string; content?: string }[] | undefined;
-    if (!Array.isArray(arr) || arr.length === 0)
-      throw new Error("files 为空或不是数组");
-    const results: string[] = [];
-    for (const f of arr) {
-      const p = String(f.path ?? "").trim();
-      if (!p) { results.push("⚠️ 跳过空路径"); continue; }
-      const c = String(f.content ?? "");
-      await writeFile(p, c, "utf8");
-      results.push(`已写入 ${p}（${c.split("\n").length} 行，${Buffer.byteLength(c)} 字节）`);
-    }
-    return results.join("\n");
-  },
-
-  async batch_edit_file({ edits }) {
-    const arr = edits as { path?: string; old_string?: string; new_string?: string }[] | undefined;
-    if (!Array.isArray(arr) || arr.length === 0)
-      throw new Error("edits 为空或不是数组");
-
-    // 预校验：先通读所有文件、检查 old_string 是否能匹配，全部通过后再落盘
-    const plans: { path: string; idx: number; oldS: string; newS: string; content: string }[] = [];
-    for (const e of arr) {
-      const p = String(e.path ?? "").trim();
-      if (!p) throw new Error("edits 中含有空路径");
-      const oldS = String(e.old_string ?? "");
-      const newS = String(e.new_string ?? "");
-      if (!oldS) throw new Error(`编辑 ${p} 时 old_string 为空`);
-      const content = await readFile(p, "utf8");
-      const idx = content.indexOf(oldS);
-      if (idx === -1)
-        throw new Error(`文件中找不到 old_string（需逐字匹配，含缩进/换行）: ${p}`);
-      if (content.indexOf(oldS, idx + 1) !== -1)
-        throw new Error(`old_string 在文件中出现多次，请提供更长、唯一的片段: ${p}`);
-      plans.push({ path: p, idx, oldS, newS, content });
-    }
-
-    // 全部预校验通过，开始写入
-    const results: string[] = [];
-    for (const plan of plans) {
-      await writeFile(
-        plan.path,
-        plan.content.slice(0, plan.idx) + plan.newS + plan.content.slice(plan.idx + plan.oldS.length),
-        "utf8"
-      );
-      results.push(`已编辑 ${plan.path}（替换 1 处）`);
-    }
-    return results.join("\n");
-  },
 };
 
 // —— 有状态工具（todo）：拿到 ctx，可读写会话任务计划、发 UI 事件（见 D3）——
@@ -687,8 +440,8 @@ export const statefulTools: Record<string, StatefulToolImpl> = {
     if (!declared.has(name)) throw new Error(`实现了未在 toolSchemas 声明的工具 ${name}`);
 }
 
-// 极简行级 diff：剥掉公共前后缀，把变化的中段按 -旧 / +新 展示。
-export function lineDiff(oldText: string, newText: string, max = 16): string {
+// 行级 diff：剥掉公共前后缀，变化中段的前3行/后3行留作上下文，中间按 -旧 / +新 展示。
+export function lineDiff(oldText: string, newText: string, max = 16, ctx = 3): string {
   const a = oldText.split("\n");
   const b = newText.split("\n");
   let p = 0;
@@ -696,10 +449,22 @@ export function lineDiff(oldText: string, newText: string, max = 16): string {
   let ea = a.length;
   let eb = b.length;
   while (ea > p && eb > p && a[ea - 1] === b[eb - 1]) (ea--, eb--);
-  const out = [
-    ...a.slice(p, ea).map((l) => `- ${l}`),
-    ...b.slice(p, eb).map((l) => `+ ${l}`),
-  ];
+  // 公共前缀后缀的上下文
+  const preCtx = Math.max(0, p - ctx);
+  const postCtxA = Math.min(a.length, ea + ctx);
+  const postCtxB = Math.min(b.length, eb + ctx);
+  const ln = (n: number) => String(n + 1).padStart(4); // 1-based 行号，4 位右对齐
+  const out: string[] = [];
+  if (preCtx < p) {
+    for (let i = preCtx; i < p; i++) out.push(`  ${ln(i)} ${a[i]}`);
+    out.push("  …");
+  }
+  for (let i = p; i < ea; i++) out.push(`- ${ln(i)} ${a[i]}`);
+  for (let i = p; i < eb; i++) out.push(`+ ${ln(i)} ${b[i]}`);
+  if (ea < postCtxA) {
+    out.push("  …");
+    for (let i = ea; i < postCtxA; i++) out.push(`  ${ln(i)} ${a[i]}`);
+  }
   if (out.length === 0) return "(无变化)";
   return out.length > max
     ? out.slice(0, max).join("\n") + "\n…(差异较多，已省略)"
@@ -715,11 +480,6 @@ export async function describeForApproval(
   args: Record<string, unknown>
 ): Promise<string> {
   if (name === "run_bash") return `$ ${String(args.command ?? "")}`;
-  if (name === "batch_run_bash") {
-    const cmds = args.commands as string[] | undefined;
-    if (!Array.isArray(cmds) || cmds.length === 0) return "batch_run_bash（空列表）";
-    return `批量执行 ${cmds.length} 条命令:\n${cmds.map((c, i) => `  ${i + 1}. $ ${String(c ?? "").trim() || "(空)"}`).join("\n")}`;
-  }
 
   if (name === "write_file") {
     const p = String(args.path ?? "");
@@ -747,51 +507,6 @@ export async function describeForApproval(
       warn = "\n⚠️ 读不到该文件（执行会失败）";
     }
     return `编辑 ${p}${warn}\n${lineDiff(oldS, newS)}`;
-  }
-
-  if (name === "batch_read_file") {
-    const paths = args.paths as string[] | undefined;
-    if (!Array.isArray(paths) || paths.length === 0) return "batch_read_file（空列表）";
-    return `批量读取 ${paths.length} 个文件:\n${paths.map((p, i) => `  ${i + 1}. ${String(p ?? "")}`).join("\n")}`;
-  }
-
-  if (name === "batch_write_file") {
-    const files = args.files as { path?: string; content?: string }[] | undefined;
-    if (!Array.isArray(files) || files.length === 0) return "batch_write_file（空列表）";
-    const lines = files.map((f, i) => {
-      const p = String(f.path ?? "");
-      const c = String(f.content ?? "");
-      const preview = c.length > 200 ? c.slice(0, 200) + "\n…(内容截断)" : c;
-      return `  ${i + 1}. ${p}（${c.split("\n").length} 行，${Buffer.byteLength(c)} 字节）\n${lineDiff("", preview)}`;
-    });
-    if (lines.length > 6) {
-      return `批量写入 ${files.length} 个文件:\n${lines.slice(0, 5).join("\n")}\n…(共 ${files.length} 个文件，省略其余)`;
-    }
-    return `批量写入 ${files.length} 个文件:\n${lines.join("\n")}`;
-  }
-
-  if (name === "batch_edit_file") {
-    const edits = args.edits as { path?: string; old_string?: string; new_string?: string }[] | undefined;
-    if (!Array.isArray(edits) || edits.length === 0) return "batch_edit_file（空列表）";
-    const lines: string[] = [];
-    for (const e of edits) {
-      const p = String(e.path ?? "");
-      const oldS = String(e.old_string ?? "");
-      const newS = String(e.new_string ?? "");
-      let warn = "";
-      try {
-        const content = await readFile(p, "utf8");
-        if (!content.includes(oldS)) warn = " ⚠️ 未找到匹配";
-      } catch {
-        warn = " ⚠️ 读不到该文件";
-      }
-      const diff = lineDiff(oldS, newS);
-      lines.push(`${p}${warn}\n${diff}`);
-    }
-    if (lines.length > 6) {
-      return `批量编辑 ${edits.length} 个文件:\n${lines.slice(0, 5).join("\n---\n")}\n…(共 ${edits.length} 个文件，省略其余)`;
-    }
-    return `批量编辑 ${edits.length} 个文件:\n${lines.join("\n---\n")}`;
   }
 
   return `${name}(${JSON.stringify(args)})`;
@@ -841,24 +556,6 @@ export function describeToolBrief(name: string, argsText: string): string {
     case "todowrite": {
       const todos = args.todos as unknown[] | undefined;
       return `todowrite [${Array.isArray(todos) ? todos.length : 0} 项]`;
-    }
-    case "batch_read_file": {
-      const paths = args.paths as string[] | undefined;
-      if (!Array.isArray(paths) || paths.length === 0)
-        return "batch_read_file（空列表）";
-      return `batch_read_file [${paths.length} 个文件]`;
-    }
-    case "batch_write_file": {
-      const files = args.files as unknown[] | undefined;
-      return `batch_write_file [${Array.isArray(files) ? files.length : 0} 个文件]`;
-    }
-    case "batch_edit_file": {
-      const edits = args.edits as unknown[] | undefined;
-      return `batch_edit_file [${Array.isArray(edits) ? edits.length : 0} 个文件]`;
-    }
-    case "batch_run_bash": {
-      const cmds = args.commands as string[] | undefined;
-      return `batch_run_bash [${Array.isArray(cmds) ? cmds.length : 0} 条]`;
     }
     default:
       return `${name}(${JSON.stringify(args)})`;

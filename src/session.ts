@@ -17,6 +17,13 @@ export interface Session {
   logger: RunLogger;
   round: number; // 第几次「用户输入」（区别于内部 think-act 轮）
   lastPromptTokens: number; // 上轮模型实际看到的 prompt token（投影大小），驱动压缩触发
+  // —— 累积 token / 费用统计（持久化，跨恢复保留）——
+  inputTokens: number;
+  outputTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  totalCost: number;
+  requestCount: number;
   // —— 压缩状态（投影用，messages 始终完整不动）——
   summaries: SummarySegment[]; // 旧段摘要，append-only
   summarizedUpTo: number; // messages[1..k] 已被 summaries 覆盖
@@ -40,6 +47,12 @@ export function createSession(): Session {
     logger,
     round: 0,
     lastPromptTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheHitTokens: 0,
+    cacheMissTokens: 0,
+    totalCost: 0,
+    requestCount: 0,
     summaries: [],
     summarizedUpTo: 0,
     memory: [],
@@ -59,6 +72,12 @@ export function adoptSession(target: Session, source: Session): void {
   target.logger = source.logger;
   target.round = source.round;
   target.lastPromptTokens = source.lastPromptTokens;
+  target.inputTokens = source.inputTokens;
+  target.outputTokens = source.outputTokens;
+  target.cacheHitTokens = source.cacheHitTokens;
+  target.cacheMissTokens = source.cacheMissTokens;
+  target.totalCost = source.totalCost;
+  target.requestCount = source.requestCount;
   target.messages.length = 0;
   target.messages.push(...source.messages);
   target.summaries = source.summaries;
@@ -79,6 +98,13 @@ export function resumeSession(stored: StoredSession): Session {
     round: stored.messages.filter((m) => m.role === "user").length,
     // 恢复时带上 ctx 大小：这样恢复后第一轮就知道要不要裁，不会先发一坨超大上下文
     lastPromptTokens: stored.lastPromptTokens ?? 0,
+    // 累积统计恢复（旧存档没有这些字段 → 默认 0）
+    inputTokens: stored.inputTokens ?? 0,
+    outputTokens: stored.outputTokens ?? 0,
+    cacheHitTokens: stored.cacheHitTokens ?? 0,
+    cacheMissTokens: stored.cacheMissTokens ?? 0,
+    totalCost: stored.totalCost ?? 0,
+    requestCount: stored.requestCount ?? 0,
     // 压缩状态直接读回（零重放）：摘要/水位线/记忆都是固化好的
     summaries: stored.summaries ?? [],
     summarizedUpTo: stored.summarizedUpTo ?? 0,
@@ -100,6 +126,12 @@ export function persist(session: Session): void {
     title,
     messages: session.messages,
     lastPromptTokens: session.lastPromptTokens,
+    inputTokens: session.inputTokens,
+    outputTokens: session.outputTokens,
+    cacheHitTokens: session.cacheHitTokens,
+    cacheMissTokens: session.cacheMissTokens,
+    totalCost: session.totalCost,
+    requestCount: session.requestCount,
     summaries: session.summaries,
     summarizedUpTo: session.summarizedUpTo,
     memory: session.memory,
