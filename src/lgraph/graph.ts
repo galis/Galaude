@@ -189,6 +189,31 @@ const timeline = (ms: BaseMessage[]) =>
     })
     .join(" → ");
 
+/**
+ * LangChain BaseMessage 版：把发送给模型的 context messages 完整记入日志（不截断）。
+ * 缩进层级：消息头部(2空格) → 消息正文(4空格) → VS Code 可按缩进折叠。
+ */
+function formatContextForLog(ms: BaseMessage[]): string {
+  const sep = "  " + "─".repeat(62);
+  const lines: string[] = [];
+  for (let i = 0; i < ms.length; i++) {
+    const m = ms[i]!;
+    const role = lcOps.role(m);
+    const text = lcOps.text(m) ?? "";
+    const len = text.length;
+    const indent = (s: string) => s.split("\n").map(l => "    " + l).join("\n");
+    let body = indent(text || "(空)");
+    if (role === "assistant") {
+      const tcs = isAIMessage(m) ? (m as AIMessage).tool_calls : undefined;
+      if (tcs?.length) {
+        body += "\n    [tool_calls: " + tcs.map((t: { name: string }) => t.name).join(", ") + "]";
+      }
+    }
+    lines.push(`  [${i + 1}] ${role} (${len} 字符)${sep}\n${body}`);
+  }
+  return lines.join("\n");
+}
+
 const lastAI = (ms: BaseMessage[]): AIMessage | null => {
   const last = ms[ms.length - 1];
   return last && isAIMessage(last) ? (last as AIMessage) : null;
@@ -317,8 +342,10 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
   logger.section(
     `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${state.messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${state.lastPromptTokens} tok）`
   );
-  if (config.traceStream) logger.log(JSON.stringify(ctx, null, 2));
-  else logger.log(timeline(ctx));
+  // 始终以每条消息摘要的形式记入日志（大段内容自动截断）；
+  // traceStream 模式下额外追加全量投影 JSON（协议研究用）。
+  logger.log(formatContextForLog(ctx));
+  if (config.traceStream) logger.log("\n[全量投影 JSON]\n" + JSON.stringify(ctx, null, 2));
 
   // 节点内自己消费 token 流并直接发事件——与手写 streamModel 行为逐字对齐，
   // 也不依赖外层 streamMode 的形状（那是另一种做法，见 docs 对照笔记）。
@@ -383,6 +410,20 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
         (aiMsg.response_metadata as { finish_reason?: string }).finish_reason ?? "?"
       }`,
     });
+  }
+
+  // 模型响应摘要（reasoning/content/tool_calls 细节见上方「流式接收内容」）
+  const finishReason = (aiMsg.response_metadata as { finish_reason?: string }).finish_reason ?? "?";
+  logger.section(`第 ${turn} 轮 — 模型响应`);
+  logger.log(
+    `[finish_reason] ${finishReason}\n` +
+    `[usage] prompt=${inTok} completion=${outTok} total=${inTok + outTok}`
+  );
+  // 协议研究模式：额外记完整组装消息
+  if (config.traceStream) {
+    logger.log(
+      `[assembled ai message]\n${JSON.stringify(aiMsg, null, 2)}`
+    );
   }
 
   return {
@@ -520,7 +561,11 @@ async function toolsNode(state: GState, cfg: LangGraphRunnableConfig) {
         }
       }
       emit({ type: "tool_result", name: tc.name, result: out });
-      logger.log(`[tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) => ${out}`);
+      logger.log(
+        out.includes("\n")
+          ? `  [tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) =>\n    ${out.replace(/\n/g, "\n    ")}`
+          : `  [tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) => ${out}`
+      );
       return new ToolMessage({ content: out, tool_call_id: id, name: tc.name });
     })
   );

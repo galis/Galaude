@@ -2,7 +2,7 @@ import type OpenAI from "openai";
 import { config } from "./config.js";
 import { renderMemory } from "./memory.js";
 import { renderTodos, type TodoPlan } from "./todo.js";
-import { scanSkills, renderSkillIndex } from "./skill.js";
+import { getSkillIndexText } from "./skill.js";
 
 type OAIMessage = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
@@ -134,25 +134,39 @@ const todoText = (plan: TodoPlan) =>
  *   摘要块只在折叠时变一次。
  * - 近段起点 messages[k+1] 落在轮边界（user 消息），所以「全 system 在前、user 在后」序列合法。
  * - 近段里偏旧的大工具输出再走层 A 裁一道。
+ * - 任务清单附在最后一个 user 消息末尾（而非独立 system），避免每轮变化打断前缀缓存。
  */
 export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[] {
   const { messages, summaries, summarizedUpTo: k, memory, globalMemory, projectMemory, lastPromptTokens, plan } = s;
   const system = messages[0];
   const ctx: M[] = system ? [system] : [];
   // Skill 第一层（常驻注入）：name + description，模型判断匹配后用 read_file 自行读取
-  const skills = scanSkills();
-  if (skills.length) ctx.push(ops.system(renderSkillIndex(skills)));
+  // 进程内缓存，只扫一次盘
+  const skillText = getSkillIndexText();
+  if (skillText) ctx.push(ops.system(skillText));
   // 项目路径（常驻注入）：模型做文件操作时以此为根
   ctx.push(ops.system(`当前工作目录: ${process.cwd()}`));
   // 合并项目记忆 + 全局记忆 + 会话级记忆，项目记忆在最前（最稳定）
   const merged = [...(projectMemory ?? []), ...(globalMemory ?? []), ...memory];
   if (merged.length) ctx.push(ops.system(renderMemory(merged)));
   if (summaries.length) ctx.push(ops.system(summaryText(summaries)));
-  if (plan && plan.todos.length) ctx.push(ops.system(todoText(plan))); // 任务清单：记忆/摘要后·近段前，豁免压缩
 
   let recent = messages.slice(k + 1); // 近段（system 与已摘要段之后）
   if (lastPromptTokens > trimThreshold) recent = trimOldToolOutputs(ops, recent);
   ctx.push(...recent);
+
+  // 任务清单附到最后一个 user 消息末尾，避免自身变化打断 prompt 前缀缓存
+  if (plan && plan.todos.length) {
+    const todoTextStr = todoText(plan);
+    for (let i = ctx.length - 1; i >= 0; i--) {
+      if (ops.role(ctx[i]!) === "user") {
+        const original = ops.text(ctx[i]!) ?? "";
+        ctx[i] = ops.withText(ctx[i]!, original ? `${original}\n\n${todoTextStr}` : todoTextStr);
+        break;
+      }
+    }
+  }
+
   return ctx;
 }
 

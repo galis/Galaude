@@ -4,7 +4,6 @@ import { createRunLogger, type RunLogger } from "./logger.js";
 import { newSessionId, saveSession, type StoredSession } from "./store.js";
 import { emptyPlan, type TodoPlan } from "./todo.js";
 import { ensureUserSkills } from "./skill.js";
-import { toolSchemas } from "./tools.js";
 import type { SummarySegment } from "./compress.js";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -36,8 +35,8 @@ export interface Session {
 /** 新建一个会话：装好 system 提示 + 一个会话级日志文件。 */
 export function createSession(): Session {
   const logger = createRunLogger();
-  logger.section("工具定义 toolSchemas（随每轮一起发给模型）");
-  logger.log(JSON.stringify(toolSchemas, null, 2));
+  logger.section("系统提示词 SYSTEM_PROMPT（messages[0]，每轮发送）");
+  logger.log(SYSTEM_PROMPT);
   const messages: Message[] = [{ role: "system", content: SYSTEM_PROMPT }];
   // 首次启动：内置 skill 复制到用户目录（幂等，已有则跳过）
   try { ensureUserSkills(); } catch { /* 非致命 */ }

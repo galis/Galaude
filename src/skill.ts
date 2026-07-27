@@ -120,6 +120,16 @@ export function renderSkillIndex(skills: SkillMeta[]): string {
   return `【可用 Skills（需要时用 read_file 读取对应文件加载完整 prompt）】\n${lines.join("\n")}`;
 }
 
+// skills 在进程生命周期内不会变，只扫一次盘，避免每轮 buildContext 重复 readdir+readFile。
+let _skillIndexCache: string | undefined;
+/** 获取已渲染的 skill 索引文本（常驻注入 buildContext，首次调用后缓存）。 */
+export function getSkillIndexText(): string {
+  if (_skillIndexCache !== undefined) return _skillIndexCache;
+  const skills = scanSkills();
+  _skillIndexCache = renderSkillIndex(skills);
+  return _skillIndexCache;
+}
+
 /** UI /skill 命令用：展示 skill 列表（名 + 描述）。 */
 export function renderSkillList(skills: SkillMeta[]): string {
   if (!skills.length) return "（未安装任何 skill）";

@@ -57,6 +57,31 @@ function timeline(messages: Message[]): string {
 }
 
 /**
+ * 把发送给模型的 context messages 完整记入日志（不截断）。
+ * 缩进层级：消息头部(2空格) → 消息正文(4空格) → VS Code 可按缩进折叠。
+ */
+function formatContextForLog(ctx: Message[]): string {
+  const sep = "  " + "─".repeat(62);
+  const lines: string[] = [];
+  for (let i = 0; i < ctx.length; i++) {
+    const m = ctx[i]!;
+    const role = m.role;
+    const content = typeof m.content === "string" ? m.content : "";
+    const len = content.length;
+    const indent = (s: string) => s.split("\n").map(l => "    " + l).join("\n");
+    let body = indent(content || "(空)");
+    if (role === "assistant") {
+      const tcs = (m as OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam).tool_calls;
+      if (tcs?.length) {
+        body += "\n    [tool_calls: " + tcs.map((t) => t.function.name).join(", ") + "]";
+      }
+    }
+    lines.push(`  [${i + 1}] ${role} (${len} 字符)${sep}\n${body}`);
+  }
+  return lines.join("\n");
+}
+
+/**
  * Phase 1 的核心：think → act → observe 循环。
  *
  *   think:    带上 tools 定义调用模型
@@ -412,10 +437,10 @@ export async function runAgent(
     logger.section(
       `第 ${turn} 轮 — 发送给模型的 messages（投影：原文 ${messages.length} 条 → 发送 ${ctx.length} 条；上轮 ctx≈${session.lastPromptTokens} tok）`
     );
-    // 全量投影 JSON 每轮重复全部历史（日志 O(n²) 膨胀），只在协议研究模式下记；
-    // 平时记 role 时间线就够定位问题了。
-    if (config.traceStream) logger.log(JSON.stringify(ctx, null, 2));
-    else logger.log(timeline(ctx));
+    // 始终以每条消息摘要的形式记入日志（大段内容自动截断）；
+    // traceStream 模式下额外追加全量投影 JSON（协议研究用）。
+    logger.log(formatContextForLog(ctx));
+    if (config.traceStream) logger.log("\n[全量投影 JSON]\n" + JSON.stringify(ctx, null, 2));
 
     // —— think（流式）——
     const { assistantMsg, finishReason, usage } = await streamModel(
@@ -428,14 +453,20 @@ export async function runAgent(
 
     // 把模型这一轮的回复（可能含 tool_calls）原样追加进历史。
     messages.push(assistantMsg);
-    logger.log(
-      `\n----- 第 ${turn} 轮 — 模型响应 -----\n` +
-        JSON.stringify(
-          { finish_reason: finishReason, usage, message: assistantMsg },
-          null,
-          2
-        )
-    );
+    // 模型响应摘要（reasoning/content/tool_calls 细节见上方「流式接收内容」）
+    logger.section(`第 ${turn} 轮 — 模型响应`);
+    if (usage) {
+      logger.log(
+        `[finish_reason] ${finishReason}\n` +
+        `[usage] prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} total=${usage.total_tokens}`
+      );
+    }
+    // 协议研究模式：额外记完整组装消息
+    if (config.traceStream) {
+      logger.log(
+        `[assembled assistant message]\n${JSON.stringify(assistantMsg, null, 2)}`
+      );
+    }
     if (usage) {
       // 记下投影实际大小：下一次 buildContext 据此决定要不要裁（也驱动 UI 的 ctx 占比）。
       session.lastPromptTokens = usage.prompt_tokens;
@@ -565,7 +596,12 @@ export async function runAgent(
     // 阶段 4：按原顺序写回 messages（observation 用 role:"tool"，tool_call_id 对应上）
     for (let i = 0; i < toolCalls.length; i++) {
       const call = toolCalls[i]!;
-      logger.log(`[tool] ${call.function.name}(${call.function.arguments}) => ${results[i]}`);
+      const tr = results[i]!;
+      logger.log(
+        tr.includes("\n")
+          ? `  [tool] ${call.function.name}(${call.function.arguments}) =>\n    ${tr.replace(/\n/g, "\n    ")}`
+          : `  [tool] ${call.function.name}(${call.function.arguments}) => ${tr}`
+      );
       messages.push({ role: "tool", tool_call_id: call.id, content: results[i]! });
     }
     // 每轮 tool 结果写回后就落一次盘：长任务中途网络报错/崩溃时，
