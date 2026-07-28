@@ -1,6 +1,7 @@
 // 内部辅助 LLM 任务（判风险 / 折叠摘要 / 合并摘要）的「提示词 + 防御式解析」。
-// 抽成纯函数模块的原因：手写引擎（openai SDK）和 LangGraph 引擎（LangChain 模型）
-// 各自发起调用，但提示词和解析规则必须是同一份，否则两个引擎行为漂移、没法对照。
+// 抽成纯函数模块的原因：主引擎（src/lgraph/，LangChain 模型）和子Agent 运行时
+//（src/subagent.ts，openai SDK）各自发起调用，但提示词和解析规则必须是同一份，
+// 否则主/子 Agent 的风险判定会漂移。
 
 /** 风险判官 system 提示。 */
 export const RISK_JUDGE_SYSTEM =

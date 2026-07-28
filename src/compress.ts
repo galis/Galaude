@@ -27,9 +27,9 @@ export const ctxBudget = budget;
 export const trimThreshold = budget * trimFrac;
 
 // ———————————————————— 消息方言适配 ————————————————————
-// 压缩逻辑本身与「消息长什么样」无关：手写引擎用 OpenAI wire 格式，
-// LangGraph 引擎用 LangChain 的 BaseMessage。这里只依赖 4 个操作，
-// 两个引擎各自提供实现（LC 版见 src/lgraph/messages.ts）。
+// 压缩逻辑本身与「消息长什么样」无关：存盘/真相源用 OpenAI wire 格式，
+// LangGraph 图状态用 LangChain 的 BaseMessage。这里只依赖 4 个操作，
+// 两种格式各自提供实现（LC 版见 src/lgraph/messages.ts）。
 
 export type MsgRole = "system" | "user" | "assistant" | "tool" | "other";
 
@@ -43,7 +43,7 @@ export interface MessageOps<M> {
   system(text: string): M;
 }
 
-/** OpenAI wire 格式的方言实现（手写引擎；也是存盘格式）。 */
+/** OpenAI wire 格式的方言实现（存盘格式 / Session.messages 真相源）。 */
 export const oaiOps: MessageOps<OAIMessage> = {
   role(m) {
     return m.role === "system" ||
@@ -170,7 +170,7 @@ export function buildContextWith<M>(ops: MessageOps<M>, s: CompressState<M>): M[
   return ctx;
 }
 
-/** OpenAI 方言绑定版（手写引擎 / UI 直接用，签名不变）。 */
+/** OpenAI 方言绑定版（contextReport / UI 直接用，签名不变）。 */
 export const buildContext = (s: CompressState): OAIMessage[] =>
   buildContextWith(oaiOps, s);
 

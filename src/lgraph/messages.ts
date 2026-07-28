@@ -1,6 +1,6 @@
 // 消息「方言」桥：OpenAI wire 格式（真相源/存盘） ↔ LangChain BaseMessage（图状态）。
-// 会话 JSON 永远存 OpenAI 格式——它同时是手写引擎的运行格式，也是两个引擎共享的
-// 唯一真相源；LangGraph 线程只是它的运行时视图（进程内 MemorySaver，见 engine.ts）。
+// 会话 JSON 永远存 OpenAI 格式——它是跨会话的唯一真相源（子Agent 运行时也直接用
+// 这个格式）；LangGraph 线程只是它的运行时视图（进程内 MemorySaver，见 engine.ts）。
 import {
   AIMessage,
   HumanMessage,

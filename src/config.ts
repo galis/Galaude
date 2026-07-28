@@ -20,17 +20,17 @@ export const config = {
   /** 主 think 模型（env: THINK_MODEL），负责核心推理/回答/工具调用 */
   model: process.env.THINK_MODEL ?? "deepseek-v4-pro",
 
-  /**
-   * 引擎选择（env: ENGINE）。两个引擎共用同一个 UI / 会话存档 / 工具注册表：
-   *   langgraph（默认）：src/lgraph/ 用 LangGraph StateGraph 实现的循环（Phase 3）
-   *   handwritten：src/agent.ts 手写 think→act→observe 循环（对照基线）
-   */
-  engine: (["handwritten", "hand", "hw"].includes(process.env.ENGINE ?? "")
-    ? "handwritten"
-    : "langgraph") as "handwritten" | "langgraph",
-
   /** 单次用户输入内 think→act 的最大轮数上限，防死循环（env: MAX_TURNS） */
   maxTurns: envNum("MAX_TURNS", 100),
+
+  /** 子 Agent 默认最大轮数（env: SUBAGENT_MAX_TURNS）。可为单个 spawn 调用覆盖。 */
+  subagentMaxTurns: envNum("SUBAGENT_MAX_TURNS", 50),
+
+  /**
+   * 同时运行的子 Agent 上限（env: SUBAGENT_MAX_CONCURRENT）。
+   * 主 Agent 一轮可以并行吐好几个 spawn_subagent，不设闸就是几条并发流一起打 API。
+   */
+  subagentMaxConcurrent: envNum("SUBAGENT_MAX_CONCURRENT", 5),
 
   /** run_bash 单条命令超时毫秒数（env: BASH_TIMEOUT_MS）。构建/测试类命令常超 15s，默认给 60s。 */
   bashTimeoutMs: envNum("BASH_TIMEOUT_MS", 60_000),

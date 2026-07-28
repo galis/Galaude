@@ -71,12 +71,17 @@ export interface RunLogger {
   section(title: string): void;
 }
 
-export function createRunLogger(): RunLogger {
+/**
+ * opts.updateLatest=false：不改 logs/last.log 软链。
+ * 子 Agent 的日志走这条路——否则每起一个子 Agent，last.log 就被抢过去，
+ * 正在 `tail -f logs/last.log` 跟主会话的人会莫名其妙断流。
+ */
+export function createRunLogger(opts: { updateLatest?: boolean } = {}): RunLogger {
   mkdirSync(LOG_DIR, { recursive: true });
   pruneOldLogs();
   const path = join(LOG_DIR, `run-${timestamp()}.log`);
   appendFileSync(path, `# Galaude run @ ${new Date().toISOString()}\n`);
-  updateLatestLink(path);
+  if (opts.updateLatest !== false) updateLatestLink(path);
   return {
     path,
     log(text: string) {

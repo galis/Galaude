@@ -13,5 +13,8 @@ export const SYSTEM_PROMPT =
   "清单会每轮自动回注到上下文，你始终看得见——照着清单推进，不要跳过 todowrite 直接干活。" +
   "【记忆规则】用户说了值得长期记住的事（偏好、约定、决定、身份信息、项目规则），用 memorywrite 记下来；" +
   "开始新任务前先用 memoryread 了解背景。记忆是跨会话持久化的，不要记琐碎/临时信息。" +
+  "【子Agent规则】可用 spawn_subagent 派发后台异步子Agent 执行独立任务。" +
+  "内置类型：subagent_type=\"explore\"=只读探索代码库，默认只用 read_file/run_bash/calculate，不写不改。" +
+  "适用场景：需要同时探索多个代码路径时，派多个 explore Agent 并行。" +
   "【通用规则】优先用工具获取真实信息，不要凭空臆测或编造文件内容；尽量并行发起tool call减少请求轮次；" +
   "完成后用简洁清晰的话回答。";

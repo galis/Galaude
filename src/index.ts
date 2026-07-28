@@ -1,10 +1,23 @@
 import "dotenv/config";
 import { createInterface } from "node:readline/promises";
-import { createSession, resumeSession } from "./session.js";
-import { runAgent } from "./engine.js"; // 引擎接缝：ENGINE=langgraph 可切换实现
+import { createSession, resumeSession, type Session } from "./session.js";
+import { runAgent } from "./engine.js"; // 引擎入口（LangGraph 全家桶在后台预加载）
 import { latestSession, loadSession } from "./store.js";
 import { contextReport } from "./compress.js";
+import { drainNotifications } from "./subagent.js";
 import { renderUI, HELP } from "./ui.js";
+
+/**
+ * 跑一轮，然后把这轮里完成的子Agent 结果继续喂给主Agent，直到没有待处理通知。
+ * 与 Ink UI 里的自动续跑（wakeRef）是同一个语义，只是这里没有事件循环要照顾，
+ * 顺着 await 往下接就行。
+ */
+async function runWithSubagentFollowUps(s: Session, input: string): Promise<void> {
+  await runAgent(s, input);
+  for (let n = drainNotifications(); n; n = drainNotifications()) {
+    await runAgent(s, n);
+  }
+}
 
 // 参数解析：
 //   --ui            强制进入交互界面（UI 优先于一次性）
@@ -45,7 +58,7 @@ if (resumeId) {
 
 // —— 一次性模式：没强制 --ui 且命令行给了问题 → 跑一次就退出（控制台输出）——
 if (!forceUi && oneShot) {
-  await runAgent(session, oneShot); // 默认 console emitter
+  await runWithSubagentFollowUps(session, oneShot); // 默认 console emitter
   process.exit(0);
 }
 
@@ -69,7 +82,7 @@ if (process.stdin.isTTY) {
       continue;
     }
     try {
-      await runAgent(session, text); // 默认 console emitter
+      await runWithSubagentFollowUps(session, text); // 默认 console emitter
     } catch (err) {
       console.error(
         `\n❌ 出错: ${err instanceof Error ? err.message : String(err)}\n`

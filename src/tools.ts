@@ -8,6 +8,7 @@ import { renderTodos, normalizeTodos, type TodoPlan } from "./todo.js";
 import { renderMemory, normalizeMemory } from "./memory.js";
 import { loadGlobalMemory, loadProjectMemory, saveProjectMemory } from "./store.js";
 import type { AgentEvent } from "./events.js";
+import { subagentRuntime, type SubagentOptions } from "./subagent.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,6 +22,47 @@ const execFileAsync = promisify(execFile);
 
 // —— 1. 声明：传给模型的 tools 定义 ——
 export const toolSchemas: OpenAI.Chat.Completions.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "spawn_subagent",
+      description:
+        "派发一个后台子 Agent 异步执行任务。子Agent 在后台运行，完成后通知主Agent。" +
+        "适用场景：并行探索多个方向、独立研究文件、后台跑测试等。" +
+        "内置类型：subagent_type=\"explore\"=只读探索代码库（默认只含 read_file/run_bash/calculate）。" +
+        "参数：subagent_type(可选)、description(简短描述)、prompt(详细任务)、allowed_tools(可选白名单)、max_turns(可选轮数上限)。" +
+        "返回立即给出 agentId，完成后主Agent 会收到 <task-notification>。",
+      parameters: {
+        type: "object",
+        properties: {
+          subagent_type: {
+            type: "string",
+            enum: ["explore"],
+            description: "内置子Agent 类型。\"explore\"=只读探索代码库（默认只用 read_file/run_bash/calculate，不写不改）。省略则为通用子Agent。",
+          },
+          description: {
+            type: "string",
+            description: "3-5 词的简短描述，用于 UI 和通知中识别该子Agent",
+          },
+          prompt: {
+            type: "string",
+            description: "子 Agent 的详细任务 prompt，应自包含（子Agent 看不到主对话）",
+          },
+          allowed_tools: {
+            type: "array",
+            items: { type: "string" },
+            description: "允许子Agent 使用的工具列表。explore 类型默认只读（read_file/run_bash/calculate）；通用类型默认除 spawn_subagent/memorywrite/todowrite 外全部可用",
+          },
+          max_turns: {
+            type: "integer",
+            description: "最大轮数上限，默认 50",
+          },
+        },
+        required: ["description", "prompt"],
+        additionalProperties: false,
+      },
+    },
+  },
   {
     type: "function",
     function: {
@@ -371,6 +413,39 @@ export interface ToolCtx {
 type StatefulToolImpl = (args: Record<string, unknown>, ctx: ToolCtx) => string;
 
 export const statefulTools: Record<string, StatefulToolImpl> = {
+  spawn_subagent({ description, prompt, subagent_type, allowed_tools, max_turns }, ctx) {
+    const desc = String(description ?? "").trim();
+    const pr = String(prompt ?? "").trim();
+    if (!desc) return "错误：description 不能为空。";
+    if (!pr) return "错误：prompt 不能为空。";
+
+    // 轮数上限钳制：模型给 0 会让子Agent 一轮不跑就"完成"，给个大数则等于没上限
+    const rawTurns = max_turns != null ? Number(max_turns) : undefined;
+    const maxTurns =
+      rawTurns != null && Number.isFinite(rawTurns)
+        ? Math.min(Math.max(Math.trunc(rawTurns), 1), config.subagentMaxTurns)
+        : undefined;
+
+    const outcome = subagentRuntime.spawn(
+      {
+        description: desc,
+        prompt: pr,
+        subagentType: subagent_type as SubagentOptions["subagentType"],
+        allowedTools: allowed_tools as string[] | undefined,
+        maxTurns,
+      },
+      ctx.emit,
+    );
+
+    if (!outcome.ok) return `派发失败：${outcome.reason}`;
+
+    const running = subagentRuntime.runningCount();
+    return (
+      `子Agent "${outcome.agentId}" 已启动（${desc}）。\n` +
+      `完成后会通知你。当前运行中的子Agent：${running} 个。`
+    );
+  },
+
   memoryread(_args, _ctx) {
     const project = loadProjectMemory();
     const global = loadGlobalMemory();

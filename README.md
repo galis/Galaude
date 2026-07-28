@@ -5,9 +5,9 @@
 纯 TypeScript 从零手写 `think → act → observe` 循环，吃透 function calling
 和 agent 编排底层原理。模型用 DeepSeek（OpenAI 兼容协议）。
 
-Phase 3 加入了 **LangGraph 引擎**（现为默认）：同一个 UI、同一份会话存档，
-`ENGINE=handwritten` 一键切回手写循环做对照（见 `docs/langgraph-vs-handwritten.md`）。
-同一个会话可以两个引擎交替接续。
+Phase 3 用 **LangGraph** 重写了执行引擎（`src/lgraph/`）。原先手写的 `while` 循环
+（`src/agent.ts`）作为对照基线跑完了它的使命，已经删除；两者的逐项对比留在
+`docs/langgraph-vs-handwritten.md`。
 
 ## 它能做什么
 
@@ -39,8 +39,7 @@ graph TB
     end
 
     subgraph 引擎层
-        Seam["engine.ts<br/>引擎接缝"]
-        HW["agent.ts<br/>手写循环引擎"]
+        Seam["engine.ts<br/>入口（后台预加载）"]
         LG["lgraph/<br/>LangGraph 引擎"]
     end
 
@@ -60,45 +59,36 @@ graph TB
     CLI --> Console
     Ink --> Seam
     Console --> Seam
-    Seam --> HW
     Seam --> LG
-    HW --> LLM
-    HW --> Tools
-    HW --> Compress
     LG --> LLM
     LG --> Tools
     LG --> Compress
-    HW --> Todo
     LG --> Todo
-    HW --> Store
-    HW --> Logger
     LG --> Store
     LG --> Logger
 ```
 
-### 双引擎对照
+### 执行引擎
 
-`engine.ts` 根据 `ENGINE` 环境变量分派到两个实现，共享同一套 UI、会话存档和工具注册表：
+`engine.ts` 只做一件事：把 LangGraph 全家桶的加载丢到后台，首屏不用等它。
 
 ```mermaid
 graph LR
-    subgraph 手写引擎
-        HW_Loop["agent.ts<br/>think→act→observe<br/>TypeScript 循环<br/>手动管理状态"]
-    end
     subgraph LangGraph 引擎
         LG_Graph["lgraph/graph.ts<br/>5 节点状态图<br/>compact → agent → judge<br/>→ approve → tools"]
         LG_Check["Checkpointer<br/>自动存档/恢复"]
     end
     subgraph 共享层
-        Shared["同一套工具 / 压缩 / LLM / 会话存档 / UI"]
+        Shared["工具 / 压缩 / LLM / 会话存档 / UI"]
     end
 
-    HW_Loop --> Shared
     LG_Graph --> Shared
     LG_Graph --> LG_Check
 ```
 
-| 对比维度 | 手写引擎 | LangGraph 引擎 |
+早期版本是手写的 `while` 循环（`src/agent.ts`），两种写法的逐项对比：
+
+| 对比维度 | 手写循环（已删除） | LangGraph 引擎（现行） |
 |---------|---------|---------------|
 | 循环控制 | 手写 `while` + `for` | 图节点 + 条件边 |
 | 状态管理 | `Session` 对象 | `StateGraph` 通道 |
@@ -124,9 +114,6 @@ npm run dev -- "把 src/compress.ts 里的 buildContext 函数重构拆成两个
 # 接续历史会话
 npm run dev -- --continue   # 接续最近一次会话
 npm run dev -- --resume <id># 接续指定会话（id 可只给前缀）
-
-# 切回手写引擎对照
-ENGINE=handwritten npm run dev
 ```
 
 会话会自动存盘到 `sessions/<id>.json`（元信息进 `sessions/index.json` 轻量索引），
@@ -188,10 +175,10 @@ src/
   store.ts      # 会话持久化（sessions/<id>.json + index.json 轻量索引）
   todo.ts       # 任务清单领域逻辑（纯函数：渲染 / 校验 / 按 id 自愈）
   compress.ts   # 上下文压缩（投影 / 裁旧工具输出 / 分段摘要 / 分级折叠；消息方言可插拔）
-  llmtasks.ts   # 判风险/摘要的「提示词 + 防御式解析」（两个引擎共用，保证行为一致）
-  agent.ts      # 手写引擎：think→act→observe 循环 + 流式 + 会话(Session)；对外发「事件」
-  engine.ts     # 引擎接缝：按 config.engine 分派到手写 / LangGraph 实现
-  lgraph/       # LangGraph 对照引擎（Phase 3）
+  llmtasks.ts   # 判风险/摘要的「提示词 + 防御式解析」（主引擎与子Agent 共用，行为一致）
+  subagent.ts   # 子Agent 运行时：后台派发 / 并发闸 / 工具准入 / 结果回注主对话
+  engine.ts     # 引擎入口：后台预加载 LangGraph，首屏不阻塞
+  lgraph/       # LangGraph 执行引擎（Phase 3）
     graph.ts    #   状态通道 + 5 节点（compact/agent/judge/approve/tools）+ 接线
     engine.ts   #   runAgentLG 适配器：播种/修补线程、interrupt↔确认门、镜像回写
     messages.ts #   消息方言桥：OpenAI wire 格式 ↔ LC BaseMessage、悬挂修补
@@ -201,7 +188,7 @@ src/
   *.test.ts     # vitest 单测（todo / 压缩双方言 / markdown / 风险规则 / 消息桥 / 解析器）
 ```
 
-> agent.ts 不直接写屏，而是把「要显示的东西」抛成事件（`AgentEvent`），
+> 引擎不直接写屏，而是把「要显示的东西」抛成事件（`AgentEvent`），
 > 由控制台或 Ink UI 决定怎么渲染——这样 Ink 接管屏幕时不会被 console.log 冲乱。
 
 ## 常用脚本
@@ -239,7 +226,7 @@ flowchart TD
     MaxTurn -- 否 --> Think
 ```
 
-- **模型只「请求」工具，代码才真正执行**：`agent.ts` 里检测 `tool_calls`，本地跑注册表里的实现。
+- **模型只「请求」工具，代码才真正执行**：`lgraph/graph.ts` 的 tools 节点检测 `tool_calls`，本地跑注册表里的实现。
 - **API 无状态**：每一轮都把完整 `messages` 历史重新传给模型。
 - **observation 回传规则**：工具结果用 `role:"tool"`，且 `tool_call_id` 必须和模型的请求一一对应。
 - **循环出口**：模型某轮不再返回 `tool_calls` → 那就是最终自然语言答案。
@@ -266,8 +253,7 @@ flowchart LR
 | --- | --- | --- |
 | `DEEPSEEK_API_KEY` | （必填） | API key |
 | `DEEPSEEK_MODEL` | `deepseek-v4-pro` | 模型名 |
-| `ENGINE` | `langgraph` | `handwritten` 切回手写引擎（对照基线） |
-| `LANGSMITH_TRACING` | 关 | `true` 开启 LangSmith 全链路追踪（仅 langgraph 引擎；注意 prompt 会上传云端） |
+| `LANGSMITH_TRACING` | 关 | `true` 开启 LangSmith 全链路追踪（注意 prompt 会上传云端） |
 | `LANGSMITH_API_KEY` | — | LangSmith key（配合上一项） |
 | `MAX_TURNS` | 30 | 单次输入内 think→act 最大轮数 |
 | `BASH_TIMEOUT_MS` | 60000 | run_bash 单条命令超时 |
@@ -287,8 +273,8 @@ flowchart LR
 - **Phase 2（已完成）**：多工具自动选择、工具报错当 observation 回喂、最大轮数上限、
   流式输出、并行工具调用、确认门（规则 + 模型双层判风险）、会话持久化/恢复、
   上下文压缩（裁剪/摘要/分级折叠/外置记忆）、任务清单、终端 markdown 渲染、单测。
-- **Phase 3（已完成）**：LangGraph 对照引擎（`ENGINE=langgraph`，同 UI/同存档双引擎并存、
-  interrupt 确认门、投影压缩复用），LangSmith 可观测性（env 两行开启）。
+- **Phase 3（已完成）**：改用 LangGraph 作为执行引擎（interrupt 确认门、投影压缩复用），
+  LangSmith 可观测性（env 两行开启）。对照跑通后手写循环已删除，
   设计取舍与逐块对照见 `docs/langgraph-vs-handwritten.md`。
 - **下一步（可选）**：time travel（按 checkpoint 分叉重跑）、`createAgent` + middleware
   第三遍对照实现。

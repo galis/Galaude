@@ -1,5 +1,5 @@
 // LangGraph 引擎的图本体：状态通道 + 5 个节点 + 接线。
-// 与手写引擎（agent.ts）逐块对应，方便对照学习：
+// 各节点与原手写循环（src/agent.ts，已删除）逐块对应，保留对照关系便于理解设计：
 //   compact ≈ maybeCompact/maybeFold   agent ≈ streamModel + 投影
 //   judge ≈ 阶段2b（规则+模型判风险）   approve ≈ 阶段2c（串行确认门）
 //   tools ≈ 阶段1/2a/3/4（并行执行、原序写回）
@@ -200,15 +200,18 @@ function formatContextForLog(ms: BaseMessage[]): string {
     const m = ms[i]!;
     const role = lcOps.role(m);
     const text = lcOps.text(m) ?? "";
-    const len = text.length;
     const indent = (s: string) => s.split("\n").map(l => "    " + l).join("\n");
-    let body = indent(text || "(空)");
+    let body = text ? indent(text) : "";
+    let len = text.length;
     if (role === "assistant") {
       const tcs = isAIMessage(m) ? (m as AIMessage).tool_calls : undefined;
       if (tcs?.length) {
-        body += "\n    [tool_calls: " + tcs.map((t: { name: string }) => t.name).join(", ") + "]";
+        body += (body ? "\n" : indent("")) + "    [tool_calls: " + tcs.map((t: { name: string }) => t.name).join(", ") + "]";
+        // tool_calls 也算输出量：加 JSON 长度
+        len += JSON.stringify(tcs).length;
       }
     }
+    if (!body) body = indent("(空)");
     lines.push(`  [${i + 1}] ${role} (${len} 字符)${sep}\n${body}`);
   }
   return lines.join("\n");
@@ -257,7 +260,7 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
       completionTokens: res.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
       cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
       cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
-      timestamp: new Date().toISOString() });
+      timestamp: new Date().toISOString(), tag: "internal" });
   }
   const { summary, facts } = parseSummary(lcText(res));
   applyCompaction(scratch, range, summary);
@@ -297,7 +300,7 @@ async function compactNode(state: GState, cfg: LangGraphRunnableConfig) {
         completionTokens: folded.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
         cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
         cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
-        timestamp: new Date().toISOString() });
+        timestamp: new Date().toISOString(), tag: "internal" });
     }
     logger.section(`🗜🗜 二级折叠 摘要段[${group[0]}..${group[1]}]`);
     emit({
@@ -402,7 +405,7 @@ async function agentNode(state: GState, cfg: LangGraphRunnableConfig) {
   if (inTok > 0 || cacheHit > 0 || cacheMiss > 0) {
     emit({ type: "usage", promptTokens: inTok, completionTokens: outTok,
       cacheHitTokens: cacheHit, cacheMissTokens: cacheMiss,
-      timestamp: new Date().toISOString() });
+      timestamp: new Date().toISOString(), tag: "main" });
     emit({
       type: "debug",
       text: `📊 token: prompt=${inTok} completion=${outTok} `
@@ -473,7 +476,7 @@ async function judgeNode(state: GState, cfg: LangGraphRunnableConfig) {
             completionTokens: res.usage_metadata?.output_tokens ?? rawU?.completion_tokens ?? 0,
             cacheHitTokens: rum?.prompt_cache_hit_tokens ?? rawU?.prompt_cache_hit_tokens,
             cacheMissTokens: rum?.prompt_cache_miss_tokens ?? rawU?.prompt_cache_miss_tokens,
-            timestamp: new Date().toISOString() });
+            timestamp: new Date().toISOString(), tag: "internal" });
         }
         if (risky) risks.push({ id, reason: `模型判定：${reason}` });
         else emit({ type: "note", text: `✓ 自动放行 ${tc.name}（低风险：${reason}）` });
@@ -561,11 +564,13 @@ async function toolsNode(state: GState, cfg: LangGraphRunnableConfig) {
         }
       }
       emit({ type: "tool_result", name: tc.name, result: out });
-      logger.log(
-        out.includes("\n")
-          ? `  [tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) =>\n    ${out.replace(/\n/g, "\n    ")}`
-          : `  [tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) => ${out}`
-      );
+      // 执行日志只显示摘要（完整内容见上方 context messages），避免重复打印
+      const lines = out.split("\n").length;
+      const bytes = Buffer.byteLength(out);
+      const summary = out.includes("\n") || out.length > 80
+        ? `(${lines} 行, ${bytes} 字节)`
+        : out;
+      logger.log(`  [tool] ${tc.name}(${JSON.stringify(tc.args ?? {})}) => ${summary}`);
       return new ToolMessage({ content: out, tool_call_id: id, name: tc.name });
     })
   );

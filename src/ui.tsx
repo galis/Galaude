@@ -2,8 +2,8 @@ import { readFileSync } from "node:fs";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { render, Box, Text, useApp, useStdin, useStdout } from "ink";
 import { createSession, resumeSession, adoptSession, persist, type Session } from "./session.js";
-import { getApprovalMode, setApprovalMode, type Emitter, type ApprovalRequest } from "./events.js";
-import { runAgent } from "./engine.js"; // 引擎接缝：ENGINE=langgraph 可切换实现
+import { getApprovalMode, setApprovalMode, SUBAGENT_STATUS_LABEL, type Emitter, type ApprovalRequest } from "./events.js";
+import { runAgent } from "./engine.js"; // 引擎入口（LangGraph 全家桶在后台预加载）
 import {
   listSessions,
   loadSession,
@@ -23,6 +23,7 @@ import { config } from "./config.js";
 import { calcCost, formatCost, peakLabel } from "./billing.js";
 import { mdToLines, plainToLines, type Line } from "./markdown.js";
 import { scanCommands, expandCommand, type CommandMeta } from "./commands.js";
+import { subagentRuntime, drainNotifications } from "./subagent.js";
 import type OpenAI from "openai";
 
 type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
@@ -39,6 +40,7 @@ export const COMMANDS: { name: string; desc: string }[] = [
   { name: "/memory", desc: "显示当前长期记忆（只读；增删让 agent 代劳）" },
   { name: "/skill", desc: "skill 管理：/skill list 列出所有（名+描述+文件路径），需要时用 read_file 读取" },
   { name: "/mode", desc: "切换确认模式 auto（判风险才确认）/ strict（一律确认）" },
+  { name: "/agents", desc: "列出后台子Agent；/agents kill <id|all> 终止" },
   { name: "/clear", desc: "清空上下文（开新对话）" },
   { name: "/exit", desc: "退出（/quit 等同）" },
 ];
@@ -57,7 +59,7 @@ export let HELP = buildHelp();
 type Item =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
-  | { kind: "tool_call"; name: string; argsText: string }
+  | { kind: "tool_call"; name: string; argsText: string; agentId?: string }
   | { kind: "tool_result"; result: string }
   | { kind: "note"; text: string }
   | { kind: "todos"; todos: Todo[] }
@@ -169,7 +171,11 @@ function itemLines(it: Item, width: number): Line[] {
     }
     case "tool_call": {
       const lines: Line[] = [];
-      lines.push([{ text: `🔧 ${it.name}`, color: it.name in pureTools ? "green" : "yellow" }]);
+      lines.push([
+        // 子Agent 的调用挂一个暗色前缀，工具名本身保持原样（配色/描述都按真名走）
+        ...(it.agentId ? [{ text: `${it.agentId} `, dim: true }] : []),
+        { text: `🔧 ${it.name}`, color: it.name in pureTools ? "green" : "yellow" },
+      ]);
       if (it.argsText) {
         try {
           const args = JSON.parse(it.argsText);
@@ -219,11 +225,17 @@ function commonPrefix(arr: string[]): string {
 }
 
 // 从 messages 里取出用户说过的话（绑定到 session 的输入历史）。
+/**
+ * 子Agent 通知是以 user 角色注入 messages 的（模型侧需要它是一条用户轮），
+ * 但它不是用户敲进来的——输入历史和界面回放都得把它认出来另行处理。
+ */
+const isTaskNotification = (text: string): boolean => text.startsWith("<task-notification>");
+
 function userTexts(messages: Message[]): string[] {
   return messages
     .filter((m) => m.role === "user")
     .map((m) => (typeof m.content === "string" ? m.content : ""))
-    .filter(Boolean);
+    .filter((t) => t && !isTaskNotification(t)); // ↑ 别让通知污染 ↑/↓ 输入历史
 }
 
 // 把已存的 messages 历史还原成屏幕条目（恢复会话时铺到界面上）。
@@ -231,7 +243,14 @@ function messagesToItems(messages: Message[]): Item[] {
   const out: Item[] = [];
   for (const m of messages) {
     if (m.role === "user") {
-      out.push({ kind: "user", text: typeof m.content === "string" ? m.content : "" });
+      const text = typeof m.content === "string" ? m.content : "";
+      // 恢复会话时，子Agent 通知按「系统提示」回放，而不是伪装成用户说的话
+      if (isTaskNotification(text)) {
+        const summary = /<summary>(.*?)<\/summary>/.exec(text)?.[1] ?? "子Agent 结果";
+        out.push({ kind: "note", text: `📬 ${summary}` });
+      } else {
+        out.push({ kind: "user", text });
+      }
     } else if (m.role === "assistant") {
       if (typeof m.content === "string" && m.content)
         out.push({ kind: "assistant", text: m.content });
@@ -323,7 +342,7 @@ function App({ session }: { session: Session }) {
   const [items, setItems] = useState<Item[]>(() => [
     {
       kind: "note",
-      text: `📝 会话 ${session.id} · 引擎 ${config.engine} · 日志 ${session.logger.path}`,
+      text: `📝 会话 ${session.id} · 日志 ${session.logger.path}`,
     },
     ...messagesToItems(session.messages), // 恢复会话时把历史铺上来
   ]);
@@ -345,6 +364,7 @@ function App({ session }: { session: Session }) {
   const [mode, setMode] = useState(getApprovalMode()); // 确认门模式 auto/strict
   const [activeTools, setActiveTools] = useState(0); // 后台正在跑的工具数
   const [todos, setTodos] = useState<Todo[]>(() => session.plan.todos); // 任务清单（面板用）
+  const [subagentCount, setSubagentCount] = useState(0); // 运行中的子Agent数
   const [tick, setTick] = useState(0); // 驱动 spinner 动画的帧计数
   const [scroll, setScroll] = useState(0); // 从底部往上滚的行数，0=跟随最新
   const [size, setSize] = useState({
@@ -383,6 +403,7 @@ function App({ session }: { session: Session }) {
       setRequestCount(ns.requestCount);
       setTotalCost(ns.totalCost);
       setTodos(ns.plan.todos); // 面板切到目标会话的清单
+      setSubagentCount(0); // 子Agent 计数归零（切换会话不跨带）
       setHistory(userTexts(ns.messages)); // 输入历史也跟着切到目标会话
       histPosRef.current = null;
       setItems([
@@ -411,6 +432,120 @@ function App({ session }: { session: Session }) {
   }, [stdout]);
 
   const push = useCallback((it: Item) => setItems((xs) => [...xs, it]), []);
+
+  // 子Agent 完成后要叫醒主Agent，而唤醒逻辑又要调用 runTurn —— 用 ref 打破这个
+  // 循环依赖（与本文件里 submitRef/switchRef 的既有写法一致）。
+  const wakeRef = useRef<() => void>(() => {});
+
+  // 一轮真正的 agent 调用。用户输入、以及「子Agent 完成后的自动续跑」都走这里，
+  // 两条路径共用同一套事件接线、确认门和中断器。
+  const runTurn = useCallback(
+    async (text: string) => {
+      busyRef.current = true; // 同步置位（见函数开头的守卫说明）
+      setBusy(true);
+      const ac = new AbortController(); // Ctrl+C 时 abort 它来中断本次生成
+      abortRef.current = ac;
+      let acc = "";
+      const emit: Emitter = (ev) => {
+        if (ev.type === "assistant") {
+          acc += ev.text;
+          setStreaming(acc);
+        } else if (ev.type === "tool_call") {
+          // 子Agent 的工具调用跑在后台，与主Agent 这一轮无关：
+          // 既不能清掉主Agent 正在流式输出的正文，也不能计进「后台运行 N 个工具」。
+          if (ev.agentId) {
+            push({ kind: "tool_call", name: ev.name, argsText: ev.argsText, agentId: ev.agentId });
+          } else {
+            acc = "";
+            setStreaming("");
+            setActiveTools((n) => n + 1); // 起一个工具
+            push({ kind: "tool_call", name: ev.name, argsText: ev.argsText });
+          }
+        } else if (ev.type === "tool_result") {
+          if (!ev.agentId) setActiveTools((n) => Math.max(0, n - 1)); // 完成一个；结果不显示（在日志里）
+        } else if (ev.type === "usage") {
+          if (ev.tag !== "internal") setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比（内部辅助调用不更新）
+          setInputTokens((n) => n + ev.promptTokens); // 累积输入 token
+          setOutputTokens((n) => n + ev.completionTokens); // 累积输出 token
+          const ch = ev.cacheHitTokens, cm = ev.cacheMissTokens;
+          if (ch != null) setCacheHitTokens((n) => n + ch);
+          if (cm != null) setCacheMissTokens((n) => n + cm);
+          setRequestCount((n) => n + 1); // 请求计数
+          // 按本次请求的真实时间戳累加费用（而非最后一次性用「此刻」算）
+          const thisCost = calcCost(config.model,
+            ev.cacheMissTokens ?? 0, ev.cacheHitTokens ?? 0,
+            ev.completionTokens, ev.timestamp);
+          setTotalCost((n) => n + thisCost);
+          // 同步回 session（持久化，隔次恢复不丢）
+          session.inputTokens += ev.promptTokens;
+          session.outputTokens += ev.completionTokens;
+          if (ch != null) session.cacheHitTokens += ch;
+          if (cm != null) session.cacheMissTokens += cm;
+          session.requestCount += 1;
+          session.totalCost += thisCost;
+        } else if (ev.type === "note") {
+          push({ kind: "note", text: ev.text }); // 如「已折叠」提示
+        } else if (ev.type === "todos") {
+          setTodos(ev.todos); // 刷新标题栏常驻的 📋 done/total
+          push({ kind: "todos", todos: ev.todos }); // 详情变化时印入流
+        } else if (ev.type === "subagent_spawned") {
+          setSubagentCount((n) => n + 1);
+          push({ kind: "note", text: `🚀 子Agent "${ev.description}" 已启动 (${ev.agentId})` });
+        } else if (ev.type === "subagent_completed") {
+          setSubagentCount(subagentRuntime.runningCount());
+          push({ kind: "note", text: `📬 子Agent "${ev.description}" ${SUBAGENT_STATUS_LABEL[ev.status]}` });
+          // 主Agent 空闲时立刻叫醒它；正忙则由 runTurn 的 finally 兜底。
+          setTimeout(() => wakeRef.current(), 0);
+        }
+      };
+      // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
+      const approve = (req: ApprovalRequest) =>
+        new Promise<boolean>((resolve) => {
+          approveResolveRef.current = resolve;
+          setApproval(req);
+        });
+      try {
+        const answer = await runAgent(session, text, emit, ac.signal, approve);
+        // 中断时流可能「优雅结束」（不抛错）：保留已生成的部分，并标注已中断。
+        if (ac.signal.aborted) {
+          if (answer.trim()) push({ kind: "assistant", text: answer });
+          push({ kind: "note", text: "⛔ 已中断" });
+        } else {
+          push({ kind: "assistant", text: answer });
+        }
+      } catch (err) {
+        if (ac.signal.aborted) push({ kind: "note", text: "⛔ 已中断" });
+        else
+          push({
+            kind: "note",
+            text: `❌ 出错: ${err instanceof Error ? err.message : String(err)}`,
+          });
+      } finally {
+        abortRef.current = null;
+        setStreaming("");
+        busyRef.current = false;
+        setBusy(false);
+        setActiveTools(0);
+        // 本轮里完成的子Agent 当时插不了队（busy），这里补一次。
+        // 用户主动中断的话就不要自作主张接着跑——结果留在 inbox，下次输入时注入。
+        if (!ac.signal.aborted) setTimeout(() => wakeRef.current(), 0);
+      }
+    },
+    [push, session]
+  );
+
+  /**
+   * 子Agent 完成后叫醒主Agent：把待处理的 <task-notification> 当作这一轮的输入。
+   * 主Agent 正忙时直接返回——runTurn 的 finally 会再查一次，不会漏。
+   */
+  const maybeWakeForSubagents = useCallback(() => {
+    if (busyRef.current) return;
+    const text = drainNotifications();
+    if (!text) return;
+    push({ kind: "note", text: "▶️ 子Agent 结果已送达，主Agent 接着处理" });
+    void runTurn(text);
+  }, [push, runTurn]);
+  wakeRef.current = maybeWakeForSubagents;
 
   const onSubmit = useCallback(
     async (raw: string) => {
@@ -444,6 +579,7 @@ function App({ session }: { session: Session }) {
         setRequestCount(0);
         setTotalCost(0);
         setTodos([]);
+        setSubagentCount(0);
         setItems([{ kind: "note", text: `${prefix} ${fresh.id}` }]);
       };
       if (text === "/exit" || text === "/quit") return exit();
@@ -520,6 +656,34 @@ function App({ session }: { session: Session }) {
               : "🔁 确认模式：strict —— 危险工具（run_bash/write_file/edit_file）一律确认",
         });
       }
+      if (text === "/agents" || text.startsWith("/agents ")) {
+        const arg = text.slice(7).trim();
+        if (arg.startsWith("kill")) {
+          const target = arg.slice(4).trim();
+          if (!target)
+            return push({ kind: "note", text: "用法：/agents kill <id> 或 /agents kill all" });
+          if (target === "all") {
+            const n = subagentRuntime.abortAll();
+            setSubagentCount(subagentRuntime.runningCount());
+            return push({ kind: "note", text: n ? `⛔ 已终止 ${n} 个子Agent` : "（没有运行中的子Agent）" });
+          }
+          const ok = subagentRuntime.abort(target);
+          setSubagentCount(subagentRuntime.runningCount());
+          return push({
+            kind: "note",
+            text: ok ? `⛔ 已终止子Agent ${target}` : `❓ 没有运行中的子Agent "${target}"`,
+          });
+        }
+        const list = subagentRuntime.list();
+        if (!list.length) return push({ kind: "note", text: "（本次运行还没派发过子Agent）" });
+        const rows = list.map(
+          (a) => `  ${a.id}  ${a.status.padEnd(9)} ${(a.elapsedMs / 1000).toFixed(1)}s  ${a.description}`
+        );
+        return push({
+          kind: "note",
+          text: "子Agent：\n" + rows.join("\n") + "\n（/agents kill <id|all> 可终止运行中的）",
+        });
+      }
       // —— 自定义命令（/ 开头且不在内置列表中）：展开模板后发送 ——
       // 注意：如果首词本身包含 /（如粘贴的路径 /home/user/file），
       // 则不是命令，直接当作普通消息处理。
@@ -548,80 +712,9 @@ function App({ session }: { session: Session }) {
       if (!isCommand) { // 非命令：正常 push user 消息
         push({ kind: "user", text });
       }
-      busyRef.current = true; // 同步置位（见函数开头的守卫说明）
-      setBusy(true);
-      const ac = new AbortController(); // Ctrl+C 时 abort 它来中断本次生成
-      abortRef.current = ac;
-      let acc = "";
-      const emit: Emitter = (ev) => {
-        if (ev.type === "assistant") {
-          acc += ev.text;
-          setStreaming(acc);
-        } else if (ev.type === "tool_call") {
-          acc = "";
-          setStreaming("");
-          setActiveTools((n) => n + 1); // 起一个工具
-          push({ kind: "tool_call", name: ev.name, argsText: ev.argsText });
-        } else if (ev.type === "tool_result") {
-          setActiveTools((n) => Math.max(0, n - 1)); // 完成一个；结果不显示（在日志里）
-        } else if (ev.type === "usage") {
-          setCtxTokens(ev.promptTokens); // 实时更新标题栏 ctx 占比
-          setInputTokens((n) => n + ev.promptTokens); // 累积输入 token
-          setOutputTokens((n) => n + ev.completionTokens); // 累积输出 token
-          const ch = ev.cacheHitTokens, cm = ev.cacheMissTokens;
-          if (ch != null) setCacheHitTokens((n) => n + ch);
-          if (cm != null) setCacheMissTokens((n) => n + cm);
-          setRequestCount((n) => n + 1); // 请求计数
-          // 按本次请求的真实时间戳累加费用（而非最后一次性用「此刻」算）
-          const thisCost = calcCost(config.model,
-            ev.cacheMissTokens ?? 0, ev.cacheHitTokens ?? 0,
-            ev.completionTokens, ev.timestamp);
-          setTotalCost((n) => n + thisCost);
-          // 同步回 session（持久化，隔次恢复不丢）
-          session.inputTokens += ev.promptTokens;
-          session.outputTokens += ev.completionTokens;
-          if (ch != null) session.cacheHitTokens += ch;
-          if (cm != null) session.cacheMissTokens += cm;
-          session.requestCount += 1;
-          session.totalCost += thisCost;
-        } else if (ev.type === "note") {
-          push({ kind: "note", text: ev.text }); // 如「已折叠」提示
-        } else if (ev.type === "todos") {
-          setTodos(ev.todos); // 刷新标题栏常驻的 📋 done/total
-          push({ kind: "todos", todos: ev.todos }); // 详情变化时印入流
-        }
-      };
-      // 工具确认门：危险工具执行前，挂起并弹确认框，等用户按 y/n 才 resolve。
-      const approve = (req: ApprovalRequest) =>
-        new Promise<boolean>((resolve) => {
-          approveResolveRef.current = resolve;
-          setApproval(req);
-        });
-      try {
-        const answer = await runAgent(session, text, emit, ac.signal, approve);
-        // 中断时流可能「优雅结束」（不抛错）：保留已生成的部分，并标注已中断。
-        if (ac.signal.aborted) {
-          if (answer.trim()) push({ kind: "assistant", text: answer });
-          push({ kind: "note", text: "⛔ 已中断" });
-        } else {
-          push({ kind: "assistant", text: answer });
-        }
-      } catch (err) {
-        if (ac.signal.aborted) push({ kind: "note", text: "⛔ 已中断" });
-        else
-          push({
-            kind: "note",
-            text: `❌ 出错: ${err instanceof Error ? err.message : String(err)}`,
-          });
-      } finally {
-        abortRef.current = null;
-        setStreaming("");
-        busyRef.current = false;
-        setBusy(false);
-        setActiveTools(0);
-      }
+      return runTurn(text);
     },
-    [busy, exit, push, session, customCommands]
+    [busy, exit, push, session, customCommands, runTurn]
   );
 
   // 用 ref 让 stdin 监听器始终拿到最新的 input/busy/onSubmit（避免闭包过期）。
@@ -1000,6 +1093,11 @@ function App({ session }: { session: Session }) {
           <Text color="magenta">
             {"  "}📋 {todos.filter((t) => t.status === "completed").length}/
             {todos.length}
+          </Text>
+        ) : null}
+        {subagentCount > 0 ? (
+          <Text color="cyanBright">
+            {"  "}🤖 {subagentCount} subagent
           </Text>
         ) : null}
         {off > 0 ? (
